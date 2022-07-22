@@ -1,8 +1,8 @@
 #! /bin/bash
 
-set -x
-
-# USAGE: ./script [machine_specs.json]
+# set -x
+rm data.json
+rm metadata.json
 
 # TODO: ensure jq, lscpu, iostat, systemd are available
 # TODO: how to capture that disk was trimmed
@@ -11,10 +11,11 @@ SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # TODO: make IP address argument
 remote="10.0.0.4"
-machine_specs="$1"
+# TODO: make this an argument
+machine_specs="machine_specs.json"
 pg_version="master"
-# TODO make this an argument that has data in the name and then parse that off
-data_directory="/var/lib/autobench1"
+# TODO make this an argument
+data_directory="/var/lib/autobench1/data"
 
 # Echos either its arguments or STDIN (if called without arguments) to STDERR
 # and exits. If STDERR is a TTY then the echoed output will be colored.
@@ -54,12 +55,12 @@ ssh_remote() {
 
 # Get system memory
 mem_total_bytes="$(ssh_remote awk '$1 == "MemTotal:" { print $2 * 1024; }' /proc/meminfo)"
-mem_total_kb=$(($mem_total_bytes / 1024))
+mem_total_kb=$(("$mem_total_bytes" / 1024))
 mem_total_mb=$(($mem_total_kb / 1024))
 mem_total_gb=$(($mem_total_mb / 1024))
 
 # Get number of CPUS
-NCPUS=$(ssh_remote lscpu -J | jq '.lscpu | .[] | select(.field == "CPU(s):") | .data | tonumber')
+ncpus=$(ssh_remote lscpu -J | jq '.lscpu | .[] | select(.field == "CPU(s):") | .data | tonumber')
 
 # Restart Postgres
 ssh_remote systemctl --user restart ab-postgresql.service
@@ -91,22 +92,19 @@ done
 jq -n {$set_gucs_str} > "$tmpdir/set_gucs.json"
 
 # Set GUCs
-# for key in "${!set_gucs[@]}"; do
-#   ssh_remote psql -c "ALTER SYSTEM SET $key = '${set_gucs[$key]}'"
-# done
+for key in "${!set_gucs[@]}"; do
+  ssh_remote psql -c "ALTER SYSTEM SET $key = '${set_gucs[$key]}'"
+done
 
 # Restart Postgres
 ssh_remote systemctl --user restart ab-postgresql.service
-
-# for key in "${!set_gucs[@]}"; do
-#     ssh_remote psql -c "SHOW $key"
-# done
 
 # Get current settings of all Postgres system values
 ssh_remote psql --tuples-only -c \
   "SELECT jsonb_object_agg(name, row_to_json(pg_settings)) from pg_settings" > \
     "$tmpdir/all_gucs.json"
 
+# pgbench['scale']=$(($mem_total_gb * 18))
 pgbench['scale']=2
 
 # Fill the pgbench database with data
@@ -123,12 +121,11 @@ db_size_post_load_pre_run=$(ssh_remote psql --tuples-only -c "SELECT pg_database
 
 # TODO: scp over /tmp/pg_log
 
-# pgbench['scale']=$(($mem_total_gb * 18))
 pgbench['runtime']=3
 pgbench['transaction_type']="tpcb-like"
 # TODO: this is too many as of now - fix it
-# pgbench['num_clients']=$(($NCPUS*8 > ${set_gucs['max_connections']} ? ${set_gucs['max_connections']} : $NCPUS*8))
-pgbench['num_clients']=2
+# pgbench['num_clients']=$(("$ncpus" * 8 > ${set_gucs['max_connections']} ? ${set_gucs['max_connections']} : "$ncpus" * 8))
+pgbench['num_clients']=10
 
 for key in "${!pgbench[@]}"; do
   pgbench_str=$pgbench_str$(printf "%s:\"%s\"," "$key" "${pgbench[$key]}")
@@ -141,7 +138,7 @@ jq -n {$pgbench_str} > "$tmpdir/pgbench_config.json"
 #    ]
 # }
 # TODO: put filesystem info in metadata file
-filesystem_info=$(ssh_remote findmnt -J "$data_directory" | jq '.filesystems[0]')
+filesystem_info=$(ssh_remote findmnt -J $(dirname "$data_directory") | jq -r '.filesystems[0]')
 device_name=$(echo "$filesystem_info" | jq -r '.source')
 
 # TODO: use hostnamectl --json to get OS info and put in metadata file
@@ -184,12 +181,13 @@ ssh_remote psql --tuples-only -c \
 
 # Put all metadata in a file
 jq -nf /dev/stdin \
-  --arg ncpu "$NCPUS" \
+  --arg ncpu "$ncpus" \
   --arg postgres_version "$pg_version" \
-  --slurpfile machine "$machine_specs" \
+  --slurpfile machine_specs "$machine_specs" \
   --slurpfile all_gucs "$tmpdir/all_gucs.json" \
   --slurpfile pgbench_config "$tmpdir/pgbench_config.json" \
   --arg mem_total_bytes "$mem_total_bytes" \
+  --arg filesystem_info "$filesystem_info" \
   --slurpfile set_gucs "$tmpdir/set_gucs.json" \
   --slurpfile pg_stat_bgwriter_post_load_pre_run "$tmpdir/pg_stat_bgwriter_post_load_pre_run.json" \
   --slurpfile pg_stat_bgwriter_post_load_post_run "$tmpdir/pg_stat_bgwriter_post_load_post_run.json" \
@@ -197,9 +195,10 @@ jq -nf /dev/stdin \
   --arg db_size_post_load_post_run "$db_size_post_load_post_run" \
   > metadata.json \
 <<'EOF'
-  {machine: $machine[0].vm_instance_info.specs}
+  {machine: $machine_specs[0].vm_instance_info.specs}
   | .machine += {ncpu: $ncpu | tonumber}
   | .machine += {mem_total_bytes: $mem_total_bytes | tonumber}
+  | .machine += {filesystem: $filesystem_info}
   | . += {postgres: {gucs: {all_gucs: $all_gucs[0], set_gucs: $set_gucs[0]}}}
   | . += {benchmark: {name: "pgbench", config: $pgbench_config[0]}}
   | . += {stats: {post_load_pre_run:
