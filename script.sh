@@ -5,11 +5,11 @@ rm data.json
 rm metadata.json
 
 # TODO: ensure jq, lscpu, iostat, systemd are available
-# TODO: how to capture that disk was trimmed
+# TODO: how to capture that disk was trimmed in metadata (or is that setup?)
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# TODO: make IP address argument
+# TODO: make this an argument
 remote="10.0.0.4"
 # TODO: make this an argument
 machine_specs="machine_specs.json"
@@ -119,7 +119,7 @@ ssh_remote psql --tuples-only -c \
 # TODO: why does the size have a bunch of whitespace in it
 db_size_post_load_pre_run=$(ssh_remote psql --tuples-only -c "SELECT pg_database_size('${pgbench['db']}')")
 
-# TODO: scp over /tmp/pg_log
+# TODO: scp over /tmp/pg_log or the pgbench log which is ??
 
 pgbench['runtime']=3
 pgbench['transaction_type']="tpcb-like"
@@ -137,7 +137,6 @@ jq -n {$pgbench_str} > "$tmpdir/pgbench_config.json"
 #       {"target":"/var/lib/autobench1", "source":"/dev/sdc", "fstype":"ext4", "options":"rw,relatime,data=writeback"}
 #    ]
 # }
-# TODO: put filesystem info in metadata file
 filesystem_info=$(ssh_remote findmnt -J $(dirname "$data_directory") | jq -r '.filesystems[0]')
 device_name=$(echo "$filesystem_info" | jq -r '.source')
 
