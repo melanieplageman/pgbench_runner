@@ -187,7 +187,7 @@ jq -nf /dev/stdin \
   --slurpfile all_gucs "$tmpdir/all_gucs.json" \
   --slurpfile pgbench_config "$tmpdir/pgbench_config.json" \
   --arg mem_total_bytes "$mem_total_bytes" \
-  --arg filesystem_info "$filesystem_info" \
+  --argjson filesystem_info "$filesystem_info" \
   --slurpfile set_gucs "$tmpdir/set_gucs.json" \
   --slurpfile pg_stat_bgwriter_post_load_pre_run "$tmpdir/pg_stat_bgwriter_post_load_pre_run.json" \
   --slurpfile pg_stat_bgwriter_post_load_post_run "$tmpdir/pg_stat_bgwriter_post_load_post_run.json" \
