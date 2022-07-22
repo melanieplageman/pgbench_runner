@@ -21,5 +21,4 @@ def parse_init(filename):
 
     return output
 
-init_dict = parse_init(sys.argv[1])
-print(json.dumps(init_dict))
+print(json.dumps(parse_init(sys.argv[1])))

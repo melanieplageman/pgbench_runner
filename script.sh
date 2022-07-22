@@ -1,10 +1,10 @@
 #! /bin/bash
 
-# set -x
+set -x
 
 # USAGE: ./script [machine_specs.json]
 
-# TODO: ensure jq and lscpu and iostat are available
+# TODO: ensure jq, lscpu, iostat, systemd are available
 # TODO: how to capture that disk was trimmed
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,6 +13,8 @@ SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 remote="10.0.0.4"
 machine_specs="$1"
 pg_version="master"
+# TODO make this an argument that has data in the name and then parse that off
+data_directory="/var/lib/autobench1"
 
 # Echos either its arguments or STDIN (if called without arguments) to STDERR
 # and exits. If STDERR is a TTY then the echoed output will be colored.
@@ -33,6 +35,7 @@ master_exit() {
 trap master_exit EXIT
 
 SSH=(ssh -o ControlPath="$tmpdir/socket")
+SCP=(scp -o ControlPath="$tmpdir/socket")
 
 # Establish SSH control master indefinitely
 "${SSH[@]}" -MNfo ControlPersist=0 $remote
@@ -57,16 +60,6 @@ mem_total_gb=$(($mem_total_mb / 1024))
 
 # Get number of CPUS
 NCPUS=$(ssh_remote lscpu -J | jq '.lscpu | .[] | select(.field == "CPU(s):") | .data | tonumber')
-
-pgbench['scale']=2
-# pgbench['scale']=$(($mem_total_gb * 18))
-pgbench['runtime']=3
-pgbench['transaction_type']="tpcb-like"
-
-for key in "${!pgbench[@]}"; do
-  pgbench_str=$pgbench_str$(printf "%s:\"%s\"," "$key" "${pgbench[$key]}")
-done
-jq -n {$pgbench_str} > "$tmpdir/pgbench_config.json"
 
 # Restart Postgres
 ssh_remote systemctl --user restart ab-postgresql.service
@@ -114,9 +107,11 @@ ssh_remote psql --tuples-only -c \
   "SELECT jsonb_object_agg(name, row_to_json(pg_settings)) from pg_settings" > \
     "$tmpdir/all_gucs.json"
 
+pgbench['scale']=2
+
 # Fill the pgbench database with data
 ssh_remote pgbench -i "${pgbench['db']}" -s "${pgbench['scale']}" &> "$tmpdir/pgbench_init.raw"
-python3 parse_init.py "$tmpdir/pgbench_init.raw" > "$tmpdir/pgbench_init.json"
+python3 pgbench_parse_init.py "$tmpdir/pgbench_init.raw" > "$tmpdir/pgbench_init.json"
 
 # Get pg_stat_bgwriter after loading data into pgbench database
 ssh_remote psql --tuples-only -c \
@@ -127,30 +122,58 @@ ssh_remote psql --tuples-only -c \
 db_size_post_load_pre_run=$(ssh_remote psql --tuples-only -c "SELECT pg_database_size('${pgbench['db']}')")
 
 # TODO: scp over /tmp/pg_log
-num_clients=$(($NCPUS*8 > ${set_gucs['max_connections']} ? ${set_gucs['max_connections']} : $NCPUS*8))
 
-# TODO: make iostat work
+# pgbench['scale']=$(($mem_total_gb * 18))
+pgbench['runtime']=3
+pgbench['transaction_type']="tpcb-like"
+# TODO: this is too many as of now - fix it
+# pgbench['num_clients']=$(($NCPUS*8 > ${set_gucs['max_connections']} ? ${set_gucs['max_connections']} : $NCPUS*8))
+pgbench['num_clients']=2
+
+for key in "${!pgbench[@]}"; do
+  pgbench_str=$pgbench_str$(printf "%s:\"%s\"," "$key" "${pgbench[$key]}")
+done
+jq -n {$pgbench_str} > "$tmpdir/pgbench_config.json"
+
+# {
+#    "filesystems": [
+#       {"target":"/var/lib/autobench1", "source":"/dev/sdc", "fstype":"ext4", "options":"rw,relatime,data=writeback"}
+#    ]
+# }
+# TODO: put filesystem info in metadata file
+filesystem_info=$(ssh_remote findmnt -J "$data_directory" | jq '.filesystems[0]')
+device_name=$(echo "$filesystem_info" | jq -r '.source')
+
+# TODO: use hostnamectl --json to get OS info and put in metadata file
+
+# TODO: add date to data and metadata (maybe as filename?)
+
 # Run iostat
-# S_TIME_FORMAT=ISO ssh_remote iostat -t -o JSON  -x 1 $device_name > "$tmpdir/iostat_output.json" &
-# iostat_pid=$!
+iostat_pid="$(
+  "${SSH[@]}" $remote "nohup env S_TIME_FORMAT=ISO iostat -t -o JSON -x 1 ${device_name@Q} > iostat.json 2> iostat.stderr & echo \$!"
+)"
 
 ssh_remote systemctl --user restart ab-postgresql.service
 # Run pgbench
 ssh_remote pgbench --progress-timestamp \
     -M prepared \
-    -c $num_clients \
-    -j $num_clients \
+    -c "${pgbench['num_clients']}" \
+    -j "${pgbench['num_clients']}" \
     -T "${pgbench['runtime']}" \
     -P1 \
     --builtin=${pgbench['transaction_type']} \
     "${pgbench['db']}" \
-    &> "$tmpdir/pgbench_run.raw"
+    > "$tmpdir/pgbench_summary.raw" \
+    2> "$tmpdir/pgbench_progress.raw"
 
-# TODO: figure out all the data that comes out -- summary and progress and make sure I am getting both and parsing them
-cp "$tmpdir/pgbench_run.raw" .
+python3 pgbench_parse_progress.py "$tmpdir/pgbench_progress.raw" > "$tmpdir/pgbench_progress.json"
+python3 pgbench_parse_summary.py "$tmpdir/pgbench_summary.raw" > "$tmpdir/pgbench_summary.json"
 
-# ssh_remote kill -INT "$iostat_pid"
-# cp "$tmpdir/iostat_output.json" iostat.json
+ssh_remote kill -INT "$iostat_pid"
+# TODO: it is printing out the name of the source file, so maybe do quiet mode?
+"${SCP[@]}" "$remote:iostat.json" "$tmpdir/iostat.raw"
+# Or maybe this guy is doing that
+jq '.sysstat.hosts[0].statistics' < "$tmpdir/iostat.raw" > "$tmpdir/iostat.json"
 
 db_size_post_load_post_run=$(ssh_remote psql --tuples-only -c "SELECT pg_database_size('${pgbench['db']}')")
 
@@ -159,8 +182,7 @@ ssh_remote psql --tuples-only -c \
   "SELECT row_to_json(pg_stat_bgwriter) from pg_stat_bgwriter" > \
     "$tmpdir/pg_stat_bgwriter_post_load_post_run.json"
 
-
-# Put all metadata in a single file
+# Put all metadata in a file
 jq -nf /dev/stdin \
   --arg ncpu "$NCPUS" \
   --arg postgres_version "$pg_version" \
@@ -188,8 +210,12 @@ EOF
 
 # Put all data in a file
 jq -nf /dev/stdin \
-  --slurpfile init "$tmpdir/pgbench_init.json" \
+  --slurpfile pgbench_init "$tmpdir/pgbench_init.json" \
+  --slurpfile pgbench_progress "$tmpdir/pgbench_progress.json" \
+  --slurpfile pgbench_summary "$tmpdir/pgbench_summary.json" \
+  --slurpfile iostat "$tmpdir/iostat.json" \
   > data.json \
 <<'EOF'
-  {init: $init[0]}
+  {pgbench: {init: $pgbench_init[0], progress: $pgbench_progress[0], summary: $pgbench_summary[0]}}
+  | . += {iostat: $iostat[0]}
 EOF
