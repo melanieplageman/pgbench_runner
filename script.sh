@@ -1,8 +1,8 @@
 #! /bin/bash
 
+# set -e
 # set -x
-rm data.json
-rm metadata.json
+rm -f data.json
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -31,14 +31,15 @@ if ! command -v jq > /dev/null; then
 fi
 
 # Be compatible with both BSD and GNU mktemp
-tmpdir="$(mktemp -dt master 2> /dev/null || mktemp -dt master.XXXX)"
+# tmpdir="$(mktemp -dt master 2> /dev/null || mktemp -dt master.XXXX)"
+tmpdir="tmp"
 
 SSH=(ssh -o ControlPath="$tmpdir/socket")
 SCP=(scp -o ControlPath="$tmpdir/socket")
 
 master_exit() {
   "${SSH[@]}" -O exit $remote &> /dev/null
-  rm -rf "$tmpdir"
+  # rm -rf "$tmpdir"
 }
 trap master_exit EXIT
 
@@ -153,20 +154,41 @@ jq -n {$pgbench_str} > "$tmpdir/pgbench_config.json"
 #       {"target":"/var/lib/autobench1", "source":"/dev/sdc", "fstype":"ext4", "options":"rw,relatime,data=writeback"}
 #    ]
 # }
-filesystem_info=$(ssh_remote findmnt -J $(dirname "$data_directory") | jq -r '.filesystems[0]')
-device_name=$(echo "$filesystem_info" | jq -r '.source')
+filesystem_info=$(ssh_remote findmnt -J $(dirname "$data_directory") | jq '.filesystems[0]')
+device_name=$(jq -r '.source' <<< "$filesystem_info")
 
 # TODO: use hostnamectl --json to get OS info and put in metadata file -- only works with newest version of systemd
 
 # TODO: add date to data and metadata (maybe as filename?)
 
-# Run `iostat` in the background and save its PID. We have to do this on the
-# remote side. If we just background and kill the local SSH process, then
-# `iostat` won't have a chance to flush its JSON output, and we'll end up with
-# malformed JSON.
-iostat_pid="$(
-  "${SSH[@]}" $remote "nohup env S_TIME_FORMAT=ISO iostat -t -o JSON -x 1 ${device_name@Q} > iostat.json 2> iostat.stderr & echo \$!"
-)"
+# We want to start `iostat` before `pgbench` and stop it afterwards. We also
+# want JSON output from `iostat`. To ensure that the JSON output from `iostat`
+# is complete, we have to:
+#
+#   1. Ensure that no other instance of `iostat` is running that may clobber
+#      our output file, and
+#   2. Make sure that it's the `iostat` process itself that receives our
+#      termination signal. If, for example, `nohup` receives the SIGTERM first,
+#      it can close the file descriptor before `iostat` can properly terminate
+#      its JSON output.
+
+ssh_remote killall iostat || true
+
+# Create a bash script that will execute `iostat` in the background, emit its
+# PID to iostat.pid, and wait.
+"${SSH[@]}" -T $remote "cat > iostat.sh" <<'EOF'
+#! /bin/bash
+S_TIME_FORMAT=ISO iostat -t -o JSON -x 1 "$@" > iostat.json 2> iostat.stderr &
+iostat_pid=$!
+echo $iostat_pid > iostat.pid
+wait $iostat_pid
+EOF
+
+# Make the `iostat.sh` script executable
+ssh_remote chmod 755 iostat.sh
+
+# We have to `nohup` and redirect both stdout and stderr here or SSH will wait
+"${SSH[@]}" $remote "nohup ./iostat.sh ${device_name@Q} &> /dev/null &"
 
 ssh_remote systemctl --user restart ab-postgresql.service
 # Run pgbench
@@ -184,9 +206,13 @@ ssh_remote pgbench --progress-timestamp \
 python3 pgbench_parse_progress.py "$tmpdir/pgbench_progress.raw" > "$tmpdir/pgbench_progress.json"
 python3 pgbench_parse_summary.py "$tmpdir/pgbench_summary.raw" > "$tmpdir/pgbench_summary.json"
 
-ssh_remote kill -INT "$iostat_pid"
+# For some reason, `iostat` won't terminate its JSON output unless it's killed
+# with SIGINT rather than SIGTERM
+"${SSH[@]}" $remote 'kill -INT $(cat iostat.pid)'
+
 # TODO: it is printing out the name of the source file, so maybe do quiet mode?
 "${SCP[@]}" "$remote:iostat.json" "$tmpdir/iostat.raw"
+
 # Or maybe this guy is doing that
 jq '.sysstat.hosts[0].statistics' < "$tmpdir/iostat.raw" > "$tmpdir/iostat.json"
 
@@ -197,7 +223,7 @@ ssh_remote psql -At > "$tmpdir/pg_stat_bgwriter_post_load_post_run.json" <<'EOF'
   SELECT row_to_json(pg_stat_bgwriter) from pg_stat_bgwriter;
 EOF
 
-# Put all metadata in a file
+# Put all metadata and data into a file
 jq -nf /dev/stdin \
   --arg ncpu "$ncpus" \
   --arg postgres_version "$pg_version" \
@@ -211,28 +237,48 @@ jq -nf /dev/stdin \
   --slurpfile pg_stat_bgwriter_post_load_post_run "$tmpdir/pg_stat_bgwriter_post_load_post_run.json" \
   --arg db_size_post_load_pre_run "$db_size_post_load_pre_run" \
   --arg db_size_post_load_post_run "$db_size_post_load_post_run" \
-  > metadata.json \
-<<'EOF'
-  {machine: $machine_specs[0].vm_instance_info.specs}
-  | .machine += {ncpu: $ncpu | tonumber}
-  | .machine += {mem_total_bytes: $mem_total_bytes | tonumber}
-  | .machine += {filesystem: $filesystem_info}
-  | . += {postgres: {gucs: {all_gucs: $all_gucs[0], set_gucs: $set_gucs[0]}}}
-  | . += {benchmark: {name: "pgbench", config: $pgbench_config[0]}}
-  | . += {stats: {post_load_pre_run:
-                    {db_size: $db_size_post_load_pre_run,pg_stat_bgwriter: $pg_stat_bgwriter_post_load_pre_run[0]},
-                  post_load_post_run:
-                    {db_size: $db_size_post_load_post_run,pg_stat_bgwriter: $pg_stat_bgwriter_post_load_post_run[0]},}}
-EOF
-
-# Put all data in a file
-jq -nf /dev/stdin \
   --slurpfile pgbench_init "$tmpdir/pgbench_init.json" \
   --slurpfile pgbench_progress "$tmpdir/pgbench_progress.json" \
   --slurpfile pgbench_summary "$tmpdir/pgbench_summary.json" \
   --slurpfile iostat "$tmpdir/iostat.json" \
   > data.json \
 <<'EOF'
-  {pgbench: {init: $pgbench_init[0], progress: $pgbench_progress[0], summary: $pgbench_summary[0]}}
-  | . += {iostat: $iostat[0]}
+  {
+    metadata: {
+      machine: ($machine_specs[0].vm_instance_info.specs + {
+        ncpu: $ncpu | tonumber,
+        mem_total_bytes: $mem_total_bytes | tonumber,
+        filesystem: $filesystem_info,
+      }),
+      postgres: {
+        version: $postgres_version,
+        gucs: {
+          all_gucs: $all_gucs[0],
+          set_gucs: $set_gucs[0],
+        },
+      },
+      benchmark: {
+        name: "pgbench",
+        config: $pgbench_config[0]
+      },
+      stats: {
+        post_load_pre_run: {
+          db_size: $db_size_post_load_pre_run,
+          pg_stat_bgwriter: $pg_stat_bgwriter_post_load_pre_run[0],
+        },
+        post_load_post_run: {
+          db_size: $db_size_post_load_post_run,
+          pg_stat_bgwriter: $pg_stat_bgwriter_post_load_post_run[0]
+        },
+      },
+    },
+    data: {
+      pgbench: {
+        init: $pgbench_init[0],
+        progress: $pgbench_progress[0],
+        summary: $pgbench_summary[0],
+      },
+      iostat: $iostat[0],
+    },
+  }
 EOF
