@@ -2,7 +2,9 @@
 
 # set -e
 # set -x
-rm -f data.json
+
+# TODO: filename as uuid
+rm -f output.json
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -10,6 +12,7 @@ SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 remote="10.0.0.4"
 # TODO: make this an argument
 machine_specs="machine_specs.json"
+# TODO: make this an argument
 pg_version="master"
 # TODO make this an argument
 data_directory="/var/lib/autobench1/data"
@@ -79,8 +82,8 @@ ncpus=$(ssh_remote lscpu -J | jq '.lscpu | .[] | select(.field == "CPU(s):") | .
 ssh_remote systemctl --user restart ab-postgresql.service
 
 # Create pgbench database
-# ssh_remote dropdb --if-exists "${pgbench[db]}"
-# ssh_remote createdb
+ssh_remote dropdb --if-exists "${pgbench[db]}"
+ssh_remote createdb
 
 declare -A set_gucs=(
   # All of these *must* be in MB so that we can do the interpolation of GUC names
@@ -111,7 +114,7 @@ for key in "${!set_gucs[@]}"; do
   ssh_remote psql -v key="$key" -v value="${set_gucs[$key]}" <<'EOF'
     ALTER SYSTEM SET :"key" = :'value';
 EOF
-done
+done > /dev/null
 
 # Restart Postgres
 ssh_remote systemctl --user restart ab-postgresql.service
@@ -172,7 +175,7 @@ device_name=$(jq -r '.source' <<< "$filesystem_info")
 #      it can close the file descriptor before `iostat` can properly terminate
 #      its JSON output.
 
-ssh_remote killall iostat || true
+ssh_remote killall iostat 2> /dev/null || true
 
 # Create a bash script that will execute `iostat` in the background, emit its
 # PID to iostat.pid, and wait.
@@ -204,14 +207,14 @@ ssh_remote pgbench --progress-timestamp \
     2> "$tmpdir/pgbench_progress.raw"
 
 python3 pgbench_parse_progress.py "$tmpdir/pgbench_progress.raw" > "$tmpdir/pgbench_progress.json"
+# TODO: fix parsing logic in summary and init to do correct datatypes etc
 python3 pgbench_parse_summary.py "$tmpdir/pgbench_summary.raw" > "$tmpdir/pgbench_summary.json"
 
 # For some reason, `iostat` won't terminate its JSON output unless it's killed
 # with SIGINT rather than SIGTERM
 "${SSH[@]}" $remote 'kill -INT $(cat iostat.pid)'
 
-# TODO: it is printing out the name of the source file, so maybe do quiet mode?
-"${SCP[@]}" "$remote:iostat.json" "$tmpdir/iostat.raw"
+"${SCP[@]}" -q "$remote:iostat.json" "$tmpdir/iostat.raw"
 
 # Or maybe this guy is doing that
 jq '.sysstat.hosts[0].statistics' < "$tmpdir/iostat.raw" > "$tmpdir/iostat.json"
@@ -241,7 +244,7 @@ jq -nf /dev/stdin \
   --slurpfile pgbench_progress "$tmpdir/pgbench_progress.json" \
   --slurpfile pgbench_summary "$tmpdir/pgbench_summary.json" \
   --slurpfile iostat "$tmpdir/iostat.json" \
-  > data.json \
+  > output.json \
 <<'EOF'
   {
     metadata: {
