@@ -4,9 +4,6 @@
 rm data.json
 rm metadata.json
 
-# TODO: ensure jq, lscpu, iostat, systemd are available
-# TODO: how to capture that disk was trimmed in metadata (or is that setup?)
-
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # TODO: make this an argument
@@ -26,8 +23,18 @@ fail() {
   exit 1
 }
 
+# TODO: how to capture that disk was trimmed in metadata (or is that setup?)
+
+# Check that jq is available locally
+if ! command -v jq > /dev/null; then
+  fail 'Please install `jq` to continue'
+fi
+
 # Be compatible with both BSD and GNU mktemp
 tmpdir="$(mktemp -dt master 2> /dev/null || mktemp -dt master.XXXX)"
+
+SSH=(ssh -o ControlPath="$tmpdir/socket")
+SCP=(scp -o ControlPath="$tmpdir/socket")
 
 master_exit() {
   "${SSH[@]}" -O exit $remote &> /dev/null
@@ -35,23 +42,28 @@ master_exit() {
 }
 trap master_exit EXIT
 
-SSH=(ssh -o ControlPath="$tmpdir/socket")
-SCP=(scp -o ControlPath="$tmpdir/socket")
-
 # Establish SSH control master indefinitely
 "${SSH[@]}" -MNfo ControlPersist=0 $remote
 
-declare -A pgbench
-
-pgbench['db']="test"
+declare -A pgbench=([db]=test)
 
 ssh_remote() {
   "${SSH[@]}" $remote env \
-    PGDATABASE="${pgbench['db']}" \
+    PGDATABASE="${pgbench[db]}" \
     PGHOST='~/.autobench/postgresql' \
     PATH='~/.autobench/postgresql/bin:$PATH' \
     "${@@Q}"
 }
+
+# Check that iostat is available on the remote
+if ! "${SSH[@]}" $remote command -v iostat > /dev/null; then
+  fail 'Please install `iostat` (part of the `sysstat` package) on the target machine to continue'
+fi
+
+# Check that lscpu is available on the remote
+if ! "${SSH[@]}" $remote command -v lscpu > /dev/null; then
+  fail 'Please install `lscpu` on the target machine to continue'
+fi
 
 # Get system memory
 mem_total_bytes="$(ssh_remote awk '$1 == "MemTotal:" { print $2 * 1024; }' /proc/meminfo)"
@@ -66,58 +78,62 @@ ncpus=$(ssh_remote lscpu -J | jq '.lscpu | .[] | select(.field == "CPU(s):") | .
 ssh_remote systemctl --user restart ab-postgresql.service
 
 # Create pgbench database
-ssh_remote dropdb --if-exists "${pgbench['db']}"
-ssh_remote createdb
+# ssh_remote dropdb --if-exists "${pgbench[db]}"
+# ssh_remote createdb
 
-declare -A set_gucs
-# All of these *must* be in MB so that we can do the interpolation of GUC names
-set_gucs['shared_buffers']=$(($mem_total_mb / 2 ))MB
-set_gucs['max_wal_size']=$((200 > $mem_total_mb*2 ? 200 : $mem_total_mb*2))MB
-set_gucs['min_wal_size']=$((200 > $mem_total_mb*2 ? 200 : $mem_total_mb*2))MB
-set_gucs['maintenance_work_mem']=$(($mem_total_mb/29 > 5120 ? 5120 : $mem_total_mb/29))MB
-set_gucs['wal_buffers']=$(($mem_total_mb/250 > 5120 ? 5120 : $mem_total_mb/250))MB
-set_gucs['max_connections']=1024
-set_gucs['autovacuum_vacuum_cost_delay']="1ms"
-set_gucs['autovacuum_freeze_max_age']=2000000000
-# TODO: make it harder to screw this up (maybe check if they are configured for OS first)
-set_gucs['huge_pages']="off"
-set_gucs['backend_flush_after']="256kB"
-set_gucs['checkpoint_completion_target']="0.9"
-set_gucs['log_checkpoints']="on"
-set_gucs['wal_compression']="on"
+declare -A set_gucs=(
+  # All of these *must* be in MB so that we can do the interpolation of GUC names
+  [shared_buffers]=$(($mem_total_mb / 2 ))MB
+  [max_wal_size]=$((200 > $mem_total_mb * 2 ? 200 : $mem_total_mb * 2))MB
+  [min_wal_size]=$((200 > $mem_total_mb * 2 ? 200 : $mem_total_mb * 2))MB
+  [maintenance_work_mem]=$(($mem_total_mb / 29 > 5120 ? 5120 : $mem_total_mb / 29))MB
+  [wal_buffers]=$(($mem_total_mb / 250 > 5120 ? 5120 : $mem_total_mb / 250))MB
+  [max_connections]=1024
+  [autovacuum_vacuum_cost_delay]=1ms
+  [autovacuum_freeze_max_age]=2000000000
 
+  # TODO: make it harder to screw this up (maybe check if they are configured for OS first)
+  [huge_pages]=off
+  [backend_flush_after]=256kB
+  [checkpoint_completion_target]=0.9
+  [log_checkpoints]=on
+  [wal_compression]=on
+)
+
+# Dump `set_gucs` as a JSON object to `set_gucs.json`
 for key in "${!set_gucs[@]}"; do
-  set_gucs_str=$set_gucs_str$(printf "%s:\"%s\"," "$key" "${set_gucs[$key]}")
-done
-jq -n {$set_gucs_str} > "$tmpdir/set_gucs.json"
+  jq -n --arg key "$key" --arg value "${set_gucs[$key]}" '{ ($key): $value }'
+done | jq -s add > "$tmpdir/set_gucs.json"
 
 # Set GUCs
 for key in "${!set_gucs[@]}"; do
-  ssh_remote psql -c "ALTER SYSTEM SET $key = '${set_gucs[$key]}'"
+  ssh_remote psql -v key="$key" -v value="${set_gucs[$key]}" <<'EOF'
+    ALTER SYSTEM SET :"key" = :'value';
+EOF
 done
 
 # Restart Postgres
 ssh_remote systemctl --user restart ab-postgresql.service
 
 # Get current settings of all Postgres system values
-ssh_remote psql --tuples-only -c \
-  "SELECT jsonb_object_agg(name, row_to_json(pg_settings)) from pg_settings" > \
-    "$tmpdir/all_gucs.json"
+ssh_remote psql -At > "$tmpdir/all_gucs.json" <<'EOF'
+  SELECT jsonb_object_agg(name, row_to_json(pg_settings)) from pg_settings;
+EOF
 
-# pgbench['scale']=$(($mem_total_gb * 18))
-pgbench['scale']=2
+# pgbench[scale]=$(($mem_total_gb * 18))
+pgbench[scale]=2
 
 # Fill the pgbench database with data
-ssh_remote pgbench -i "${pgbench['db']}" -s "${pgbench['scale']}" &> "$tmpdir/pgbench_init.raw"
+# ssh_remote pgbench -i "${pgbench[db]}" -s "${pgbench['scale']}" &> "$tmpdir/pgbench_init.raw"
+ssh_remote pgbench -i -s "${pgbench['scale']}" &> "$tmpdir/pgbench_init.raw"
 python3 pgbench_parse_init.py "$tmpdir/pgbench_init.raw" > "$tmpdir/pgbench_init.json"
 
 # Get pg_stat_bgwriter after loading data into pgbench database
-ssh_remote psql --tuples-only -c \
-  "SELECT row_to_json(pg_stat_bgwriter) from pg_stat_bgwriter" > \
-    "$tmpdir/pg_stat_bgwriter_post_load_pre_run.json"
+ssh_remote psql -At > "$tmpdir/pg_stat_bgwriter_post_load_pre_run.json" <<'EOF'
+  SELECT row_to_json(pg_stat_bgwriter) from pg_stat_bgwriter;
+EOF
 
-# TODO: why does the size have a bunch of whitespace in it
-db_size_post_load_pre_run=$(ssh_remote psql --tuples-only -c "SELECT pg_database_size('${pgbench['db']}')")
+db_size_post_load_pre_run=$(ssh_remote psql -At -c "SELECT pg_database_size('${pgbench[db]}')")
 
 # TODO: scp over /tmp/pg_log or the pgbench log which is ??
 
@@ -140,11 +156,14 @@ jq -n {$pgbench_str} > "$tmpdir/pgbench_config.json"
 filesystem_info=$(ssh_remote findmnt -J $(dirname "$data_directory") | jq -r '.filesystems[0]')
 device_name=$(echo "$filesystem_info" | jq -r '.source')
 
-# TODO: use hostnamectl --json to get OS info and put in metadata file
+# TODO: use hostnamectl --json to get OS info and put in metadata file -- only works with newest version of systemd
 
 # TODO: add date to data and metadata (maybe as filename?)
 
-# Run iostat
+# Run `iostat` in the background and save its PID. We have to do this on the
+# remote side. If we just background and kill the local SSH process, then
+# `iostat` won't have a chance to flush its JSON output, and we'll end up with
+# malformed JSON.
 iostat_pid="$(
   "${SSH[@]}" $remote "nohup env S_TIME_FORMAT=ISO iostat -t -o JSON -x 1 ${device_name@Q} > iostat.json 2> iostat.stderr & echo \$!"
 )"
@@ -158,7 +177,7 @@ ssh_remote pgbench --progress-timestamp \
     -T "${pgbench['runtime']}" \
     -P1 \
     --builtin=${pgbench['transaction_type']} \
-    "${pgbench['db']}" \
+    "${pgbench[db]}" \
     > "$tmpdir/pgbench_summary.raw" \
     2> "$tmpdir/pgbench_progress.raw"
 
@@ -171,12 +190,12 @@ ssh_remote kill -INT "$iostat_pid"
 # Or maybe this guy is doing that
 jq '.sysstat.hosts[0].statistics' < "$tmpdir/iostat.raw" > "$tmpdir/iostat.json"
 
-db_size_post_load_post_run=$(ssh_remote psql --tuples-only -c "SELECT pg_database_size('${pgbench['db']}')")
+db_size_post_load_post_run=$(ssh_remote psql -At -c "SELECT pg_database_size('${pgbench[db]}')")
 
 # Get pg_stat_bgwriter after running pgbench
-ssh_remote psql --tuples-only -c \
-  "SELECT row_to_json(pg_stat_bgwriter) from pg_stat_bgwriter" > \
-    "$tmpdir/pg_stat_bgwriter_post_load_post_run.json"
+ssh_remote psql -At > "$tmpdir/pg_stat_bgwriter_post_load_post_run.json" <<'EOF'
+  SELECT row_to_json(pg_stat_bgwriter) from pg_stat_bgwriter;
+EOF
 
 # Put all metadata in a file
 jq -nf /dev/stdin \
