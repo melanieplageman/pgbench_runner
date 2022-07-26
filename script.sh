@@ -17,6 +17,8 @@ pg_version="master"
 # TODO make this an argument
 data_directory="/var/lib/autobench1/data"
 
+# TODO: can I do anything about configuring huge pages here?
+
 # Echos either its arguments or STDIN (if called without arguments) to STDERR
 # and exits. If STDERR is a TTY then the echoed output will be colored.
 fail() {
@@ -85,6 +87,10 @@ ssh_remote systemctl --user restart ab-postgresql.service
 ssh_remote dropdb --if-exists "${pgbench[db]}"
 ssh_remote createdb
 
+# pg_prewarm should be built and installed
+ssh_remote psql -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm" > /dev/null
+
+
 declare -A set_gucs=(
   # All of these *must* be in MB so that we can do the interpolation of GUC names
   [shared_buffers]=$(($mem_total_mb / 2 ))MB
@@ -124,11 +130,13 @@ ssh_remote psql -At > "$tmpdir/all_gucs.json" <<'EOF'
   SELECT jsonb_object_agg(name, row_to_json(pg_settings)) from pg_settings;
 EOF
 
-# pgbench[scale]=$(($mem_total_gb * 18))
-pgbench[scale]=2
+pgbench[scale]=$(($mem_total_gb * 18))
+# pgbench[scale]=2
+
+# TODO: also add mode with pgbench transaction logging to this
+# pgbench --log
 
 # Fill the pgbench database with data
-# ssh_remote pgbench -i "${pgbench[db]}" -s "${pgbench['scale']}" &> "$tmpdir/pgbench_init.raw"
 ssh_remote pgbench -i -s "${pgbench['scale']}" &> "$tmpdir/pgbench_init.raw"
 python3 pgbench_parse_init.py "$tmpdir/pgbench_init.raw" > "$tmpdir/pgbench_init.json"
 
@@ -139,13 +147,13 @@ EOF
 
 db_size_post_load_pre_run=$(ssh_remote psql -At -c "SELECT pg_database_size('${pgbench[db]}')")
 
-# TODO: scp over /tmp/pg_log or the pgbench log which is ??
+# Pre-warm the database
+ssh_remote psql -c "SELECT pg_prewarm(oid::regclass, 'buffer'), relname FROM pg_class WHERE relname LIKE 'pgbench%'" > /dev/null
 
-pgbench['runtime']=3
+pgbench['runtime']=1800
 pgbench['transaction_type']="tpcb-like"
-# TODO: this is too many as of now - fix it
-# pgbench['num_clients']=$(("$ncpus" * 8 > ${set_gucs['max_connections']} ? ${set_gucs['max_connections']} : "$ncpus" * 8))
-pgbench['num_clients']=10
+# TODO: not sure about the number of clients
+pgbench['num_clients']=$(("$ncpus" * 6 > ${set_gucs['max_connections']} ? ${set_gucs['max_connections']} : "$ncpus" * 6))
 
 for key in "${!pgbench[@]}"; do
   pgbench_str=$pgbench_str$(printf "%s:\"%s\"," "$key" "${pgbench[$key]}")
@@ -159,10 +167,31 @@ jq -n {$pgbench_str} > "$tmpdir/pgbench_config.json"
 # }
 filesystem_info=$(ssh_remote findmnt -J $(dirname "$data_directory") | jq '.filesystems[0]')
 device_name=$(jq -r '.source' <<< "$filesystem_info")
+small_device_name=$(basename $device_name)
 
-# TODO: use hostnamectl --json to get OS info and put in metadata file -- only works with newest version of systemd
+# TODO: where to get the hardware queues actually in use
+declare -A block_device_settings=(
+  [nr_requests]=$(ssh_remote cat /sys/block/$small_device_name/queue/nr_requests)
+  [scheduler]=$(ssh_remote cat /sys/block/$small_device_name/queue/scheduler)
+  [rotational]=$(ssh_remote cat /sys/block/$small_device_name/queue/rotational)
+  [wbt_lat_usec]=$(ssh_remote cat /sys/block/$small_device_name/queue/wbt_lat_usec)
+  [max_sectors_kb]=$(ssh_remote cat /sys/block/$small_device_name/queue/max_sectors_kb)
+  [read_ahead_kb]=$(ssh_remote cat /sys/block/$small_device_name/queue/read_ahead_kb)
+  [queue_depth]=$(ssh_remote cat /sys/block/$small_device_name/device/queue_depth)
+  [nr_hw_queues]=$(ssh_remote cat /sys/module/hv_storvsc/parameters/storvsc_max_hw_queues)
+)
 
-# TODO: add date to data and metadata (maybe as filename?)
+# Dump `block_device_settings` as a JSON object to `block_device_settings.json`
+for key in "${!block_device_settings[@]}"; do
+  if [ "$key" != scheduler ]; then
+    jq -n --arg key "$key" --arg value "${block_device_settings[$key]}" '{ ($key): $value | tonumber }'
+  else
+    jq -n --arg key "$key" --arg value "${block_device_settings[$key]}" '{ ($key): $value }'
+  fi
+done | jq -s add > "$tmpdir/block_device_settings.json"
+
+cp $tmpdir/block_device_settings.json .
+
 
 # We want to start `iostat` before `pgbench` and stop it afterwards. We also
 # want JSON output from `iostat`. To ensure that the JSON output from `iostat`
@@ -207,7 +236,6 @@ ssh_remote pgbench --progress-timestamp \
     2> "$tmpdir/pgbench_progress.raw"
 
 python3 pgbench_parse_progress.py "$tmpdir/pgbench_progress.raw" > "$tmpdir/pgbench_progress.json"
-# TODO: fix parsing logic in summary and init to do correct datatypes etc
 python3 pgbench_parse_summary.py "$tmpdir/pgbench_summary.raw" > "$tmpdir/pgbench_summary.json"
 
 # For some reason, `iostat` won't terminate its JSON output unless it's killed
@@ -216,7 +244,6 @@ python3 pgbench_parse_summary.py "$tmpdir/pgbench_summary.raw" > "$tmpdir/pgbenc
 
 "${SCP[@]}" -q "$remote:iostat.json" "$tmpdir/iostat.raw"
 
-# Or maybe this guy is doing that
 jq '.sysstat.hosts[0].statistics' < "$tmpdir/iostat.raw" > "$tmpdir/iostat.json"
 
 db_size_post_load_post_run=$(ssh_remote psql -At -c "SELECT pg_database_size('${pgbench[db]}')")
@@ -226,15 +253,29 @@ ssh_remote psql -At > "$tmpdir/pg_stat_bgwriter_post_load_post_run.json" <<'EOF'
   SELECT row_to_json(pg_stat_bgwriter) from pg_stat_bgwriter;
 EOF
 
+# Copy over Postgres log file
+"${SCP[@]}" -q "$remote:/tmp/pg_log" "$tmpdir/pg_log"
+
+datetime=$(date -Iseconds)
+hostinfo=$(ssh_remote hostnamectl --json=short)
+
+# Make a results directory if it doesn't already exist
+resultsdir=results
+mkdir -p "$resultsdir"
+output_filename="$resultsdir/$(uuidgen).json"
+
 # Put all metadata and data into a file
 jq -nf /dev/stdin \
   --arg ncpu "$ncpus" \
+  --arg datetime "$datetime" \
+  --slurpfile block_device_settings "$tmpdir/block_device_settings.json" \
   --arg postgres_version "$pg_version" \
   --slurpfile machine_specs "$machine_specs" \
   --slurpfile all_gucs "$tmpdir/all_gucs.json" \
   --slurpfile pgbench_config "$tmpdir/pgbench_config.json" \
   --arg mem_total_bytes "$mem_total_bytes" \
   --argjson filesystem_info "$filesystem_info" \
+  --argjson hostinfo "$hostinfo" \
   --slurpfile set_gucs "$tmpdir/set_gucs.json" \
   --slurpfile pg_stat_bgwriter_post_load_pre_run "$tmpdir/pg_stat_bgwriter_post_load_pre_run.json" \
   --slurpfile pg_stat_bgwriter_post_load_post_run "$tmpdir/pg_stat_bgwriter_post_load_post_run.json" \
@@ -244,14 +285,17 @@ jq -nf /dev/stdin \
   --slurpfile pgbench_progress "$tmpdir/pgbench_progress.json" \
   --slurpfile pgbench_summary "$tmpdir/pgbench_summary.json" \
   --slurpfile iostat "$tmpdir/iostat.json" \
-  > output.json \
+  > "$output_filename" \
 <<'EOF'
   {
     metadata: {
+      datetime: $datetime,
       machine: ($machine_specs[0].vm_instance_info.specs + {
         ncpu: $ncpu | tonumber,
         mem_total_bytes: $mem_total_bytes | tonumber,
         filesystem: $filesystem_info,
+        disk: {block_device_settings: $block_device_settings[0]},
+        hostinfo: $hostinfo
       }),
       postgres: {
         version: $postgres_version,
@@ -264,16 +308,6 @@ jq -nf /dev/stdin \
         name: "pgbench",
         config: $pgbench_config[0]
       },
-      stats: {
-        post_load_pre_run: {
-          db_size: $db_size_post_load_pre_run,
-          pg_stat_bgwriter: $pg_stat_bgwriter_post_load_pre_run[0],
-        },
-        post_load_post_run: {
-          db_size: $db_size_post_load_post_run,
-          pg_stat_bgwriter: $pg_stat_bgwriter_post_load_post_run[0]
-        },
-      },
     },
     data: {
       pgbench: {
@@ -282,6 +316,16 @@ jq -nf /dev/stdin \
         summary: $pgbench_summary[0],
       },
       iostat: $iostat[0],
+    },
+    stats: {
+      post_load_pre_run: {
+        db_size: $db_size_post_load_pre_run,
+        pg_stat_bgwriter: $pg_stat_bgwriter_post_load_pre_run[0],
+      },
+      post_load_post_run: {
+        db_size: $db_size_post_load_post_run,
+        pg_stat_bgwriter: $pg_stat_bgwriter_post_load_post_run[0]
+      },
     },
   }
 EOF
