@@ -418,11 +418,11 @@ jq -nf /dev/stdin \
     },
     stats: {
       post_load_pre_run: {
-        db_size: $db_size_post_load_pre_run,
+        db_size: $db_size_post_load_pre_run | tonumber,
         pg_stat_bgwriter: $pg_stat_bgwriter_post_load_pre_run[0],
       },
       post_load_post_run: {
-        db_size: $db_size_post_load_post_run,
+        db_size: $db_size_post_load_post_run | tonumber,
         pg_stat_bgwriter: $pg_stat_bgwriter_post_load_post_run[0]
       },
     },
