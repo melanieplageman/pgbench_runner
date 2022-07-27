@@ -19,7 +19,7 @@ usage() {
   local script="$(basename "${0:-${BASH_SOURCE[0]}}")"
   local margin="$(printf '%*s' ${#script})"
 while IFS= read -r line; do echo "${line/  /}"; done <<EOF
-  Usage: $script [-T TIME] [-s SCALE] [--prewarm] HOST
+  Usage: $script [-T TIME] [-s SCALE] [--prewarm] [--load-data] HOST
 
   Run \`pgbench\` on the remote HOST
 
@@ -32,6 +32,10 @@ while IFS= read -r line; do echo "${line/  /}"; done <<EOF
 
     -h, --help                  show this help message and exit
 
+    --load-data                 if provided, recreate the pgbench database and fill it
+                                data at the specified scale
+
+
   Arguments:
     HOST                        remote host where \`pgbench\` should be run
 EOF
@@ -39,13 +43,15 @@ EOF
 
 declare -A pgbench=([db]=test [time]=3 [client]=1 [scale]=2 [prewarm]=0)
 
+load_data=0
 # Process options in a loop breaking when a non-option argument is encountered
 while [[ $# -gt 0 && $1 = -* ]]; do case "$1" in
   -T|--time)   shift; pgbench[time]="$1" ;;
   -c|--client) shift; pgbench[client]="$1" ;;
   -s|--scale)  shift; pgbench[scale]="$1" ;;
-  --prewarm)   shift; pgbench[prewarm]=1 ;;
+  --prewarm)   pgbench[prewarm]=1 ;;
   -h|--help)   usage; exit 0 ;;
+  --load-data) load_data=1 ;;
   *)           usage 1>&2; exit 1 ;;
 esac; shift; done
 
@@ -150,11 +156,15 @@ fi
 ncpus=$(ssh_remote lscpu -J | jq '.lscpu | .[] | select(.field == "CPU(s):") | .data | tonumber')
 
 # Restart Postgres
+# It is important to ensure that linger is set for this user for logind or
+# Postgres will be shutdown whenever we log out
 ssh_remote systemctl --user restart ab-postgresql.service
 
 # Create pgbench database
-ssh_remote dropdb --if-exists "${pgbench[db]}"
-ssh_remote createdb
+if [ "$load_data" -eq 1 ] ; then
+  ssh_remote dropdb --if-exists "${pgbench[db]}"
+  ssh_remote createdb
+fi
 
 # pg_prewarm should be built and installed
 ssh_remote psql -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm" > /dev/null
@@ -208,10 +218,12 @@ EOF
 # pgbench scale. This is often a good number to try out.
 
 # Fill the pgbench database with data
-# It is important to ensure that linger is set for this user for logind or
-# Postgres will be shutdown whenever we log out
-ssh_remote pgbench -i -s "${pgbench[scale]}" &> "$tmpdir/pgbench_init.raw"
-python3 pgbench_parse_init.py "$tmpdir/pgbench_init.raw" > "$tmpdir/pgbench_init.json"
+if [ "$load_data" -eq 1 ] ; then
+  ssh_remote pgbench -i -s "${pgbench[scale]}" &> "$tmpdir/pgbench_init.raw"
+  python3 pgbench_parse_init.py "$tmpdir/pgbench_init.raw" > "$tmpdir/pgbench_init.json"
+else
+  jq -n '"skipped"' > "$tmpdir/pgbench_init.json"
+fi
 
 # Get pg_stat_bgwriter after loading data into pgbench database
 ssh_remote psql -At > "$tmpdir/pg_stat_bgwriter_post_load_pre_run.json" <<'EOF'
