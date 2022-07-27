@@ -19,7 +19,7 @@ usage() {
   local script="$(basename "${0:-${BASH_SOURCE[0]}}")"
   local margin="$(printf '%*s' ${#script})"
 while IFS= read -r line; do echo "${line/  /}"; done <<EOF
-  Usage: $script [-T TIME] [-s SCALE] [--prewarm] [--load-data] HOST
+  Usage: $script [-T TIME] [-s SCALE] [--prewarm] [--load-data] [--trim] HOST
 
   Run \`pgbench\` on the remote HOST
 
@@ -34,6 +34,8 @@ while IFS= read -r line; do echo "${line/  /}"; done <<EOF
 
     --load-data                 if provided, recreate the pgbench database and fill it
                                 data at the specified scale
+    --trim                      if provided, fstrim will be run on the mountpoint
+                                associated with the data directory before the run
 
 
   Arguments:
@@ -44,6 +46,7 @@ EOF
 declare -A pgbench=([db]=test [time]=3 [client]=1 [scale]=2 [prewarm]=0)
 
 load_data=0
+trim=0
 # Process options in a loop breaking when a non-option argument is encountered
 while [[ $# -gt 0 && $1 = -* ]]; do case "$1" in
   -T|--time)   shift; pgbench[time]="$1" ;;
@@ -52,6 +55,7 @@ while [[ $# -gt 0 && $1 = -* ]]; do case "$1" in
   --prewarm)   pgbench[prewarm]=1 ;;
   -h|--help)   usage; exit 0 ;;
   --load-data) load_data=1 ;;
+  --trim)      trim=1 ;;
   *)           usage 1>&2; exit 1 ;;
 esac; shift; done
 
@@ -59,9 +63,6 @@ esac; shift; done
 if [ $# -gt 1 ]; then usage 1>&2; exit 1; fi
 
 remote="$1"
-
-# TODO: how to capture that disk was trimmed in metadata (or is that setup? -
-# is there a utility that will give you such stats?)
 
 # Check that jq is available locally
 if ! command -v jq > /dev/null; then
@@ -211,7 +212,15 @@ ssh_remote psql -At > "$tmpdir/all_gucs.json" <<'EOF'
   SELECT jsonb_object_agg(name, row_to_json(pg_settings)) from pg_settings;
 EOF
 
-# TODO: also add mode with pgbench transaction logging to this
+data_directory="$(ssh_remote psql -At -c 'SHOW data_directory;')"
+
+if [ $trim -eq 1 ] ; then
+  dir_to_trim=$(dirname "$data_directory")
+  ssh_remote sudo fstrim $dir_to_trim
+fi
+
+# TODO: also add mode with pgbench transaction logging to this which tars up
+# the logfiles and copies them over
 # pgbench --log
 
 # Previously, I was using the formula: ($mem_total_gb * 18) to calculate the
@@ -261,7 +270,6 @@ done | jq -s add > "$tmpdir/pgbench_config.json"
 #       {"target":"/var/lib/autobench1", "source":"/dev/sdc", "fstype":"ext4", "options":"rw,relatime,data=writeback"}
 #    ]
 # }
-data_directory="$(ssh_remote psql -At -c 'SHOW data_directory;')"
 filesystem_info=$(ssh_remote findmnt -J $(dirname "$data_directory") | jq '.filesystems[0]')
 device_name=$(jq -r '.source' <<< "$filesystem_info")
 small_device_name=$(basename $device_name)
@@ -378,6 +386,7 @@ jq -nf /dev/stdin \
   --slurpfile pgbench_config "$tmpdir/pgbench_config.json" \
   --arg mem_total_bytes "$mem_total_bytes" \
   --argjson filesystem_info "$filesystem_info" \
+  --arg trim "$trim" \
   --argjson hostinfo "$hostinfo" \
   --slurpfile set_gucs "$tmpdir/set_gucs.json" \
   --slurpfile pg_stat_bgwriter_post_load_pre_run "$tmpdir/pg_stat_bgwriter_post_load_pre_run.json" \
@@ -404,6 +413,7 @@ jq -nf /dev/stdin \
         disk: ($specs[0].host.disk + {
           block_device_settings: $block_device_settings[0],
           filesystem: $filesystem_info,
+          trim: $trim | tonumber,
         }),
       },
       postgres: ($specs[0].postgres + {
