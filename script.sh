@@ -240,9 +240,21 @@ fi
 pgbench[transaction_type]=tpcb-like
 
 for key in "${!pgbench[@]}"; do
-  pgbench_str=$pgbench_str$(printf "%s:\"%s\"," "$key" "${pgbench[$key]}")
-done
-jq -n {$pgbench_str} > "$tmpdir/pgbench_config.json"
+  if [[ "$key" == "scale" || "$key" == "client" || "$key" == "prewarm" || "$key" == "time" ]] ; then
+    jq -n --arg key "$key" --arg value "${pgbench[$key]}" '{ ($key): $value | tonumber }'
+  else
+    jq -n --arg key "$key" --arg value "${pgbench[$key]}" '{ ($key): $value }'
+  fi
+done | jq -s add > "$tmpdir/pgbench_config.json"
+
+# jq -nf /dev/stdin \
+#   --arg client "${pgbench[client]}" \
+#   --arg prewarm "${pgbench[prewarm]}" \
+#   --arg scale "${pgbench[scale]}" \
+#   --arg db "${pgbench[db]}" \
+#   --arg time "${pgbench[time]}" \
+# <<'EOF'
+# EOF
 
 # {
 #    "filesystems": [
