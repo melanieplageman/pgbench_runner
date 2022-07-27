@@ -242,7 +242,6 @@ filesystem_info=$(ssh_remote findmnt -J $(dirname "$data_directory") | jq '.file
 device_name=$(jq -r '.source' <<< "$filesystem_info")
 small_device_name=$(basename $device_name)
 
-# TODO: where to get the hardware queues actually in use
 declare -A block_device_settings=(
   [nr_requests]=$(ssh_remote cat /sys/block/$small_device_name/queue/nr_requests)
   [scheduler]=$(ssh_remote cat /sys/block/$small_device_name/queue/scheduler)
@@ -251,7 +250,7 @@ declare -A block_device_settings=(
   [max_sectors_kb]=$(ssh_remote cat /sys/block/$small_device_name/queue/max_sectors_kb)
   [read_ahead_kb]=$(ssh_remote cat /sys/block/$small_device_name/queue/read_ahead_kb)
   [queue_depth]=$(ssh_remote cat /sys/block/$small_device_name/device/queue_depth)
-  [nr_hw_queues]=$(ssh_remote cat /sys/module/hv_storvsc/parameters/storvsc_max_hw_queues)
+  [nr_hw_queues]=$(ssh_remote ls -1 /sys/block/$small_device_name/mq | wc -l)
 )
 
 # Dump `block_device_settings` as a JSON object to `block_device_settings.json`
