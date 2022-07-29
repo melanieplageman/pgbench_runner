@@ -182,8 +182,11 @@ if [ "$load_data" -eq 1 ] ; then
   ssh_remote createdb
 fi
 
-# pg_prewarm should be built and installed
-ssh_remote psql -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm" > /dev/null
+# CREATE EXTENSION pg_prewarm if it will be used
+# Note that the pg_prewarm binary must already be built and installed
+if [ "${pgbench[prewarm]}" -eq 1 ] ; then
+  ssh_remote psql -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm" > /dev/null
+fi
 
 declare -A set_gucs=(
   # All sizes with identifier after *must* be in MB so that we can do the
