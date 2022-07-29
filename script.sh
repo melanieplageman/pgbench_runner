@@ -37,6 +37,7 @@ while IFS= read -r line; do echo "${line/  /}"; done <<EOF
     --trim                      if provided, fstrim will be run on the mountpoint
                                 associated with the data directory before the run
 
+    --init                      if provided, re-initialize the Postgres cluster
 
   Arguments:
     HOST                        remote host where \`pgbench\` should be run
@@ -47,6 +48,7 @@ declare -A pgbench=([db]=test [time]=3 [client]=1 [scale]=2 [prewarm]=0)
 
 load_data=0
 trim=0
+init=0
 # Process options in a loop breaking when a non-option argument is encountered
 while [[ $# -gt 0 && $1 = -* ]]; do case "$1" in
   -T|--time)   shift; pgbench[time]="$1" ;;
@@ -56,6 +58,7 @@ while [[ $# -gt 0 && $1 = -* ]]; do case "$1" in
   -h|--help)   usage; exit 0 ;;
   --load-data) load_data=1 ;;
   --trim)      trim=1 ;;
+  --init)      init=1 ;;
   *)           usage 1>&2; exit 1 ;;
 esac; shift; done
 
@@ -161,6 +164,18 @@ ncpus=$(ssh_remote lscpu -J | jq '.lscpu | .[] | select(.field == "CPU(s):") | .
 # Postgres will be shutdown whenever we log out
 ssh_remote systemctl --user restart ab-postgresql.service
 
+data_directory="$(ssh_remote psql -At -d postgres -c 'SHOW data_directory;')"
+
+if [ $init -eq 1 ]; then
+  ssh_remote systemctl --user stop ab-postgresql.service
+  ssh_remote rm -rf "$data_directory"
+  ssh_remote initdb -D "$data_directory"
+  ssh_remote systemctl --user start ab-postgresql.service
+  # When re-init'ing the cluster, we must create the test database, even if
+  # load-data was not specified, otherwise it won't exist to run pgbench
+  ssh_remote createdb
+fi
+
 # Create pgbench database
 if [ "$load_data" -eq 1 ] ; then
   ssh_remote dropdb --if-exists "${pgbench[db]}"
@@ -212,7 +227,6 @@ ssh_remote psql -At > "$tmpdir/all_gucs.json" <<'EOF'
   SELECT jsonb_object_agg(name, row_to_json(pg_settings)) from pg_settings;
 EOF
 
-data_directory="$(ssh_remote psql -At -c 'SHOW data_directory;')"
 
 if [ $trim -eq 1 ] ; then
   dir_to_trim=$(dirname "$data_directory")
@@ -223,15 +237,17 @@ fi
 # the logfiles and copies them over
 # pgbench --log
 
+# TODO: add a large read that is run with pgbench -f
+
 # Previously, I was using the formula: ($mem_total_gb * 18) to calculate the
 # pgbench scale. This is often a good number to try out.
 
 # Fill the pgbench database with data
 if [ "$load_data" -eq 1 ] ; then
-  ssh_remote pgbench -i -s "${pgbench[scale]}" &> "$tmpdir/pgbench_init.raw"
-  python3 pgbench_parse_init.py "$tmpdir/pgbench_init.raw" > "$tmpdir/pgbench_init.json"
+  ssh_remote pgbench -i -s "${pgbench[scale]}" &> "$tmpdir/pgbench_load.raw"
+  python3 pgbench_parse_load.py "$tmpdir/pgbench_load.raw" > "$tmpdir/pgbench_load.json"
 else
-  jq -n '"skipped"' > "$tmpdir/pgbench_init.json"
+  jq -n '"skipped"' > "$tmpdir/pgbench_load.json"
 fi
 
 # Get pg_stat_bgwriter after loading data into pgbench database
@@ -387,13 +403,15 @@ jq -nf /dev/stdin \
   --arg mem_total_bytes "$mem_total_bytes" \
   --argjson filesystem_info "$filesystem_info" \
   --arg trim "$trim" \
+  --arg init "$init" \
+  --arg load_data "$load_data" \
   --argjson hostinfo "$hostinfo" \
   --slurpfile set_gucs "$tmpdir/set_gucs.json" \
   --slurpfile pg_stat_bgwriter_post_load_pre_run "$tmpdir/pg_stat_bgwriter_post_load_pre_run.json" \
   --slurpfile pg_stat_bgwriter_post_load_post_run "$tmpdir/pg_stat_bgwriter_post_load_post_run.json" \
   --arg db_size_post_load_pre_run "$db_size_post_load_pre_run" \
   --arg db_size_post_load_post_run "$db_size_post_load_post_run" \
-  --slurpfile pgbench_init "$tmpdir/pgbench_init.json" \
+  --slurpfile pgbench_load "$tmpdir/pgbench_load.json" \
   --slurpfile pgbench_progress "$tmpdir/pgbench_progress.json" \
   --slurpfile pgbench_summary "$tmpdir/pgbench_summary.json" \
   --slurpfile iostat "$tmpdir/iostat.json" \
@@ -419,6 +437,8 @@ jq -nf /dev/stdin \
       postgres: ($specs[0].postgres + {
         version: $postgres_version,
         data_directory: $data_directory,
+        init: $init | tonumber,
+        load_data: $load_data | tonumber,
         prewarm: $prewarm | tonumber,
         gucs: {
           all_gucs: $all_gucs[0],
@@ -432,7 +452,7 @@ jq -nf /dev/stdin \
     },
     data: {
       pgbench: {
-        init: $pgbench_init[0],
+        load: $pgbench_load[0],
         progress: $pgbench_progress[0],
         summary: $pgbench_summary[0],
       },
