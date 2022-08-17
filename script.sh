@@ -39,6 +39,10 @@ while IFS= read -r line; do echo "${line/  /}"; done <<EOF
 
     --init                      if provided, re-initialize the Postgres cluster
 
+    --large-read                if provided, run pgbench with a custom file which will
+                                do a large read concurrently with the regular tpcb-like
+                                workload
+
   Arguments:
     HOST                        remote host where \`pgbench\` should be run
 EOF
@@ -49,16 +53,20 @@ declare -A pgbench=([db]=test [time]=3 [client]=1 [scale]=2 [prewarm]=0)
 load_data=0
 trim=0
 init=0
+# TODO: this should be replaced with a custom script file that does what I am looking for
+large_read=0
+# TODO: make it take an argument that specifies the type of large read
 # Process options in a loop breaking when a non-option argument is encountered
 while [[ $# -gt 0 && $1 = -* ]]; do case "$1" in
-  -T|--time)   shift; pgbench[time]="$1" ;;
-  -c|--client) shift; pgbench[client]="$1" ;;
-  -s|--scale)  shift; pgbench[scale]="$1" ;;
-  --prewarm)   pgbench[prewarm]=1 ;;
-  -h|--help)   usage; exit 0 ;;
-  --load-data) load_data=1 ;;
-  --trim)      trim=1 ;;
-  --init)      init=1 ;;
+  -T|--time)    shift; pgbench[time]="$1" ;;
+  -c|--client)  shift; pgbench[client]="$1" ;;
+  -s|--scale)   shift; pgbench[scale]="$1" ;;
+  --prewarm)    pgbench[prewarm]=1 ;;
+  -h|--help)    usage; exit 0 ;;
+  --load-data)  load_data=1 ;;
+  --trim)       trim=1 ;;
+  --init)       init=1 ;;
+  --large-read) large_read=1 ;;
   *)           usage 1>&2; exit 1 ;;
 esac; shift; done
 
@@ -260,6 +268,14 @@ EOF
 
 db_size_post_load_pre_run=$(ssh_remote psql -At -c "SELECT pg_database_size('${pgbench[db]}')")
 
+# Load data for large read, if specified
+if [[ "$large_read" -eq 1 && "$load_data" -eq 1 ]]; then
+  "${SCP[@]}" -q create_large_read.sql "$remote:/tmp/create_large_read.sql"
+  "${SCP[@]}" -q blackhole.py "$remote:blackhole.py"
+  echo "Loading data for large read..."
+  ssh_remote psql -f /tmp/create_large_read.sql
+fi
+
 # Pre-warm the database
 if [ "${pgbench[prewarm]}" -eq 1 ] ; then
   ssh_remote psql -c "SELECT pg_prewarm(oid::regclass, 'buffer'), relname FROM pg_class WHERE relname LIKE 'pgbench%'" > /dev/null
@@ -344,6 +360,14 @@ ssh_remote chmod 755 iostat.sh
 
 ssh_remote systemctl --user restart ab-postgresql.service
 
+# TODO: ensure psycopg2 is available
+if [ "$large_read" -eq 1 ]; then
+  sleeptime=$(("${pgbench[time]}" / 3))
+  echo "will sleep before read for $sleeptime seconds"
+  ssh_remote python3 blackhole.py "$sleeptime" &
+  blackhole_pid=$!
+fi
+
 # min(ncpus * 6, max_connections) was the rule of thumb I was using for the
 # number of clients and jobs
 
@@ -358,6 +382,11 @@ ssh_remote pgbench --progress-timestamp \
     "${pgbench[db]}" \
     > "$tmpdir/pgbench_summary.raw" \
     2> "$tmpdir/pgbench_progress.raw"
+
+
+if [ "$large_read" -eq 1 ]; then
+  wait "$blackhole_pid"
+fi
 
 python3 pgbench_parse_progress.py "$tmpdir/pgbench_progress.raw" > "$tmpdir/pgbench_progress.json"
 python3 pgbench_parse_summary.py "$tmpdir/pgbench_summary.raw" > "$tmpdir/pgbench_summary.json"
@@ -390,6 +419,13 @@ resultsdir=results
 mkdir -p "$resultsdir"
 output_filename="$resultsdir/$(uuidgen).json"
 
+# TODO: make this better
+if [ $large_read -eq 1 ]; then
+  large_read="select_star"
+else
+  large_read="none"
+fi
+
 # Put all metadata and data into a file
 jq -nf /dev/stdin \
   --arg ncpu "$ncpus" \
@@ -403,6 +439,7 @@ jq -nf /dev/stdin \
   --slurpfile specs "$tmpdir/specs.json" \
   --slurpfile all_gucs "$tmpdir/all_gucs.json" \
   --slurpfile pgbench_config "$tmpdir/pgbench_config.json" \
+  --arg large_read "$large_read" \
   --arg mem_total_bytes "$mem_total_bytes" \
   --argjson filesystem_info "$filesystem_info" \
   --arg trim "$trim" \
@@ -450,7 +487,8 @@ jq -nf /dev/stdin \
       }),
       benchmark: {
         name: "pgbench",
-        config: $pgbench_config[0]
+        config: $pgbench_config[0],
+        large_read: $large_read
       },
     },
     data: {
