@@ -242,6 +242,7 @@ jq '.sysstat.hosts[0].statistics' < "$tmpdir/iostat.raw" > "$tmpdir/iostat.json"
 jq -nf /dev/stdin \
   --arg datetime "$datetime" \
   --slurpfile set_gucs "$tmpdir/set_gucs.json" \
+  --argjson filesystem_info "$filesystem_info" \
   --argjson hostinfo "$hostinfo" \
   --arg ncpu "$ncpus" \
   --arg data_directory "$PRIMARY_DATADIR" \
@@ -252,12 +253,12 @@ jq -nf /dev/stdin \
   --arg db_size_post_load_pre_run "$db_size_post_load_pre_run" \
   --arg db_size_post_load_post_run "$db_size_post_load_post_run" \
   --arg mem_total_bytes "$mem_total_bytes" \
-  --argjson filesystem_info "$filesystem_info" \
   --slurpfile pgbench_load "$tmpdir/pgbench_load.json" \
   --slurpfile block_device_settings "$tmpdir/block_device_settings.json" \
   --slurpfile pgbench_progress "$tmpdir/pgbench_progress.json" \
   --slurpfile pgbench_summary "$tmpdir/pgbench_summary.json" \
   --slurpfile dirtywriteback "dirtywriteback.json" \
+  --slurpfile iostat "$tmpdir/iostat.json" \
   > "$output_filename" \
 <<'EOF'
   {
@@ -293,6 +294,7 @@ jq -nf /dev/stdin \
         summary: $pgbench_summary[0],
       },
       dirtywriteback: $dirtywriteback[0],
+      iostat: $iostat[0],
     },
     stats: {
       post_load_pre_run: {
