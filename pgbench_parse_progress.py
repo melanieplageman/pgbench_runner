@@ -23,8 +23,9 @@ for line in f:
     data = match.groupdict()
 
     data['ts'] = datetime.fromtimestamp(
-        float(data['ts']), tz=timezone.utc
-    ).isoformat(timespec='milliseconds')
+        float(data['ts']))
+    data['ts'] = data['ts'].astimezone()
+    data['ts'] = data['ts'].isoformat(timespec='milliseconds')
     data['tps'] = float(data['tps'])
     data['lat'] = float(data['lat'])
     data['stddev'] = float(data['stddev'])
