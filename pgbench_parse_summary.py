@@ -4,6 +4,9 @@ import re
 import json
 import sys
 
+# duration: 100 s
+re_duration = re.compile(r"^duration: (\d+.) s")
+
 # latency average = 2.591 ms
 re_latency_average = re.compile(r"^latency average = (\d+.\d+) ms")
 
@@ -20,6 +23,11 @@ f = open(sys.argv[1])
 data = {}
 
 for line in f:
+    match = re_duration.match(line)
+    if match is not None:
+        data['duration'] = int(match.group(1))
+        continue
+
     match = re_latency_average.match(line)
     if match is not None:
         data['lat_avg'] = float(match.group(1))
@@ -39,5 +47,7 @@ for line in f:
     if match is not None:
         data['connection_time'] = float(match.group(1))
         continue
+
+    data['duration'] = data.get('duration', None)
 
 json.dump(data, sys.stdout)
