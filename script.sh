@@ -184,6 +184,7 @@ if [ $init -eq 1 ]; then
   ssh_remote createdb
 fi
 
+# TODO: inconsistent use of specifying database name and using PGDATABASE
 # Create pgbench database
 if [ "$load_data" -eq 1 ] ; then
   ssh_remote dropdb --if-exists "${pgbench[db]}"
