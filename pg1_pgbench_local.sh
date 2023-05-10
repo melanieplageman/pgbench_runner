@@ -21,6 +21,7 @@ declare -A pgbench=([db]=${DB} [time]=10 [client]=10 [scale]=10)
 init=1
 load_data=1
 do_custom_ddl=0
+process_name=checkpointer
 
 pgbench[builtin_script]=tpcb-like
 
@@ -116,16 +117,6 @@ EOF
 
 killall iostat 2> /dev/null || true
 
-cat > iostat.sh <<'EOF'
-#! /bin/bash
-S_TIME_FORMAT=ISO iostat -t -y -o JSON -x 1 "$1" > iostat.json 2> iostat.stderr &
-iostat_pid=$!
-echo $iostat_pid > iostat.pid
-wait $iostat_pid
-EOF
-
-chmod 755 iostat.sh
-
 if [ "$load_data" -eq 1 ] ; then
   ${PRIMARY_INSTALLDIR}/dropdb \
     --port "${PRIMARY_PORT}" \
@@ -176,9 +167,16 @@ db_size_post_load_pre_run=$("${PSQL_PRIMARY[@]}" \
 "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
 
 # Dirty writeback
-./run_dirty.sh &
+./dirty.sh &
+dirty_pid=$!
 
-./iostat.sh "${device_name}" &> /dev/null &
+# iostat
+S_TIME_FORMAT=ISO iostat -t -y -o JSON -x 1 "$device_name" > iostat.json &
+iostat_pid=$!
+
+# pidstat
+pidstat -p $(pgrep -f "$process_name") -d -h -H -l 1 > pidstat_"$process_name".raw &
+pidstat_pid=$!
 
 # TODO: parse out scheduler name
 if [ "$do_custom_ddl" -eq 1 ] ; then
@@ -223,21 +221,41 @@ db_size_post_load_post_run=$("${PSQL_PRIMARY[@]}" \
     "SELECT pg_database_size('${pgbench[db]}')" \
 )
 
-cp "$PRIMARY_LOGFILE" "$tmpdir/logfile_after"
-
 postgres_version="$("${PSQL_PRIMARY[@]}" \
     -At -c 'SELECT version();')"
+
+cp "$PRIMARY_LOGFILE" "$tmpdir/logfile_after"
+
+kill -INT $dirty_pid $iostat_pid $pidstat_pid
 
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_progress.py "$tmpdir/pgbench_progress.raw" > "$tmpdir/pgbench_progress.json"
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_summary.py "$tmpdir/pgbench_summary.raw" > "$tmpdir/pgbench_summary.json"
 
-kill $(cat dirty.pid)
-
-kill -INT $(cat iostat.pid)
-
+# Parse iostat output
 cp iostat.json "$tmpdir/iostat.raw"
-
 jq '.sysstat.hosts[0].statistics' < "$tmpdir/iostat.raw" > "$tmpdir/iostat.json"
+
+# Parse pidstat output
+# pidstat command should produce output like this
+# Time        UID       PID   kB_rd/s   kB_wr/s kB_ccwr/s iodelay  Command
+
+while read -r time uid pid kbrds kbwrs kbccwrs iodelay cmd; do
+  jq -n \
+    --arg time "$time" \
+    --arg kbrds "$kbrds" \
+    --arg kbwrs "$kbwrs" \
+    --arg kbccwrs "$kbccwrs" \
+    --arg iodelay "$iodelay" \
+    '{
+      "ts": $time | tonumber,
+      "kB_rd/s": $kbrds | tonumber,
+      "kB_wr/s": $kbwrs | tonumber,
+      "kB_ccwr/s": $kbccwrs | tonumber,
+      iodelay: $iodelay | tonumber
+    }'
+done < <(
+  head -n -1 "pidstat_${process_name}.raw" | tail -n +4
+) | jq -s . > "pidstat_${process_name}.json"
 
 jq -nf /dev/stdin \
   --arg datetime "$datetime" \
@@ -259,6 +277,8 @@ jq -nf /dev/stdin \
   --slurpfile pgbench_summary "$tmpdir/pgbench_summary.json" \
   --slurpfile dirtywriteback "dirtywriteback.json" \
   --slurpfile iostat "$tmpdir/iostat.json" \
+  --slurpfile pidstat_data pidstat_"${process_name}".json \
+  --arg pidstat_procname "$process_name" \
   > "$output_filename" \
 <<'EOF'
   {
@@ -295,6 +315,12 @@ jq -nf /dev/stdin \
       },
       dirtywriteback: $dirtywriteback[0],
       iostat: $iostat[0],
+      pidstat: [
+        {
+          name: $pidstat_procname,
+          data: $pidstat_data[0],
+        }
+      ]
     },
     stats: {
       post_load_pre_run: {
