@@ -167,8 +167,8 @@ db_size_post_load_pre_run=$("${PSQL_PRIMARY[@]}" \
 "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
 
 # Dirty writeback
-./dirty.sh &
-dirty_pid=$!
+./meminfo.sh &
+meminfo_pid=$!
 
 # iostat
 S_TIME_FORMAT=ISO iostat -t -y -o JSON -x 1 "$device_name" > iostat.json &
@@ -226,7 +226,8 @@ postgres_version="$("${PSQL_PRIMARY[@]}" \
 
 cp "$PRIMARY_LOGFILE" "$tmpdir/logfile_after"
 
-kill -INT $dirty_pid $iostat_pid $pidstat_pid
+kill -INT $iostat_pid $pidstat_pid
+kill $meminfo_pid
 
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_progress.py "$tmpdir/pgbench_progress.raw" > "$tmpdir/pgbench_progress.json"
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_summary.py "$tmpdir/pgbench_summary.raw" > "$tmpdir/pgbench_summary.json"
@@ -275,7 +276,7 @@ jq -nf /dev/stdin \
   --slurpfile block_device_settings "$tmpdir/block_device_settings.json" \
   --slurpfile pgbench_progress "$tmpdir/pgbench_progress.json" \
   --slurpfile pgbench_summary "$tmpdir/pgbench_summary.json" \
-  --slurpfile dirtywriteback "dirtywriteback.json" \
+  --slurpfile meminfo "meminfo.json" \
   --slurpfile iostat "$tmpdir/iostat.json" \
   --slurpfile pidstat_data pidstat_"${process_name}".json \
   --arg pidstat_procname "$process_name" \
@@ -313,7 +314,7 @@ jq -nf /dev/stdin \
         progress: $pgbench_progress[0],
         summary: $pgbench_summary[0],
       },
-      dirtywriteback: $dirtywriteback[0],
+      meminfo: $meminfo[0],
       iostat: $iostat[0],
       pidstat: [
         {
