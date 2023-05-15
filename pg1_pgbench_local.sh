@@ -8,6 +8,8 @@ PRIMARY_PORT=5432
 PRIMARY_DATADIR_ROOT="/mnt/slow"
 PRIMARY_DATADIR="$PRIMARY_DATADIR_ROOT/pgdata"
 PRIMARY_INSTALLDIR="/home/mplageman/code/pginstall1/bin"
+PRIMARY_BUILDDIR="/home/mplageman/code/pgbuild1"
+SOURCEDIR="/home/mplageman/code/pgsource"
 PRIMARY_LOGFILE="/tmp/logfile"
 DB="postgres"
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,6 +50,12 @@ hostinfo=$(hostnamectl --json=short)
 mem_total_bytes="$(awk '$1 == "MemTotal:" { print $2 * 1024; }' /proc/meminfo)"
 # Get NCPUS
 ncpus=$(lscpu -J | jq '.lscpu | .[] | select(.field == "CPU(s):") | .data | tonumber')
+
+# Get postgres build options (can change join to use try catch in case input is not a list)
+compile_options=$(meson introspect --buildoptions $PRIMARY_BUILDDIR | jq '.[] | select(.name == "c_args") | .value | join("_")')
+
+# Get build sha
+build_sha=$(git --git-dir=$SOURCEDIR/.git --work-tree=$SOURCEDIR rev-parse --short=7 HEAD)
 
 filesystem_info=$(findmnt -J "$PRIMARY_DATADIR_ROOT" | jq '.filesystems[0]')
 device_name=$(jq -r '.source' <<< "$filesystem_info")
@@ -280,6 +288,8 @@ jq -nf /dev/stdin \
   --slurpfile iostat "$tmpdir/iostat.json" \
   --slurpfile pidstat_data pidstat_"${process_name}".json \
   --arg pidstat_procname "$process_name" \
+  --arg build_sha "$build_sha" \
+  --arg compile_options "$compile_options" \
   > "$output_filename" \
 <<'EOF'
   {
@@ -298,6 +308,10 @@ jq -nf /dev/stdin \
       },
       postgres: {
         version: $postgres_version,
+        build: {
+          sha: $build_sha,
+          compile_options: $compile_options,
+        },
         data_directory: $data_directory,
         init: $init | tonumber,
         load_data: $load_data | tonumber,
