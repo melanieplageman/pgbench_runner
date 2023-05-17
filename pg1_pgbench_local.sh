@@ -45,6 +45,7 @@ output_filename="$resultsdir/$(uuidgen).json"
 
 datetime=$(date -Iseconds)
 hostinfo=$(hostnamectl --json=short)
+cpufreq_governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
 
 # Get system memory
 mem_total_bytes="$(awk '$1 == "MemTotal:" { print $2 * 1024; }' /proc/meminfo)"
@@ -220,6 +221,9 @@ else
 fi
 
 
+kill -INT $iostat_pid $pidstat_pid
+kill $meminfo_pid
+
 "${PSQL_PRIMARY[@]}" \
     -c "SELECT pg_stat_force_next_flush(); SELECT * FROM pg_stat_io;" \
     &> "$tmpdir/pg_stat_io_post_load_post_run"
@@ -234,15 +238,19 @@ postgres_version="$("${PSQL_PRIMARY[@]}" \
 
 cp "$PRIMARY_LOGFILE" "$tmpdir/logfile_after"
 
-kill -INT $iostat_pid $pidstat_pid
-kill $meminfo_pid
-
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_progress.py "$tmpdir/pgbench_progress.raw" > "$tmpdir/pgbench_progress.json"
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_summary.py "$tmpdir/pgbench_summary.raw" > "$tmpdir/pgbench_summary.json"
 
 # Parse iostat output
 cp iostat.json "$tmpdir/iostat.raw"
 jq '.sysstat.hosts[0].statistics' < "$tmpdir/iostat.raw" > "$tmpdir/iostat.json"
+
+copy_table_size_after=0
+
+if [ "$do_custom_ddl" -eq 1 ] ; then
+  copy_table_size_after="$("${PSQL_PRIMARY[@]}" \
+      -At -c "SELECT pg_total_relation_size('test_copy');")"
+fi
 
 # Parse pidstat output
 # pidstat command should produce output like this
@@ -290,6 +298,8 @@ jq -nf /dev/stdin \
   --arg pidstat_procname "$process_name" \
   --arg build_sha "$build_sha" \
   --arg compile_options "$compile_options" \
+  --arg copy_table_size_after "$copy_table_size_after" \
+  --arg cpufreq_governor "$cpufreq_governor" \
   > "$output_filename" \
 <<'EOF'
   {
@@ -300,6 +310,7 @@ jq -nf /dev/stdin \
           hostinfo: $hostinfo,
           mem_total_bytes: $mem_total_bytes | tonumber,
           ncpu: $ncpu | tonumber,
+          cpufreq_governor: $cpufreq_governor,
         },
         disk: {
           block_device_settings: $block_device_settings[0],
@@ -327,6 +338,7 @@ jq -nf /dev/stdin \
         load: $pgbench_load[0],
         progress: $pgbench_progress[0],
         summary: $pgbench_summary[0],
+        copy_table_size_after: $copy_table_size_after | tonumber,
       },
       meminfo: $meminfo[0],
       iostat: $iostat[0],
