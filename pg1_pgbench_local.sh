@@ -48,12 +48,29 @@ hostinfo=$(hostnamectl --json=short)
 cpufreq_governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
 
 # Get system memory
-mem_total_bytes="$(awk '$1 == "MemTotal:" { print $2 * 1024; }' /proc/meminfo)"
+mem_total_kb="$(awk '$1 == "MemTotal:" { print $2; }' /proc/meminfo)"
+mem_total_bytes="$(echo "$mem_total_kb * 1024" | bc)"
+
+huge_pages_total="$(awk '$1 == "HugePages_Total:" { print $2; }' /proc/meminfo)"
+huge_pages_free="$(awk '$1 == "HugePages_Free:" { print $2; }' /proc/meminfo)"
+huge_pages_size_kb="$(awk '$1 == "Hugepagesize:" { print $2 ; }' /proc/meminfo)"
+
+shared_buffers_kb=$(echo "$var_shared_buffers * 8" | bc)
+
+enough_hugepages=$(echo "($shared_buffers_kb / $huge_pages_size_kb) + 5" | bc)
+
+postgres_huge_pages="off"
+if [ $huge_pages_free -gt $enough_hugepages ]; then
+  postgres_huge_pages="on"
+fi
+
 # Get NCPUS
 ncpus=$(lscpu -J | jq '.lscpu | .[] | select(.field == "CPU(s):") | .data | tonumber')
 
 # Get postgres build options (can change join to use try catch in case input is not a list)
 compile_options=$(meson introspect --buildoptions $PRIMARY_BUILDDIR | jq '.[] | select(.name == "c_args") | .value | join("_")')
+build_cassert=$(meson introspect --buildoptions $PRIMARY_BUILDDIR | jq '.[] | select(.name == "cassert") | .value')
+build_debug=$(meson introspect --buildoptions $PRIMARY_BUILDDIR | jq '.[] | select(.name == "debug") | .value')
 
 # Get build sha
 build_sha=$(git --git-dir=$SOURCEDIR/.git --work-tree=$SOURCEDIR rev-parse --short=7 HEAD)
@@ -115,9 +132,18 @@ else
   "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
 fi
 
-# "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = '1MB';"
-"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = 0;"
-"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET shared_buffers = '2MB';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = '${var_backend_flush_after}';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_wal_size = '30GB';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_connections = 500;"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_prepared_transactions = 1000;"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET track_io_timing=on;"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET log_checkpoints = on;"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET huge_pages = '$postgres_huge_pages';"
+
+# "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = 0;"
+# "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET shared_buffers = '1GB';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET shared_buffers = '${var_shared_buffers}';"
+# "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET checkpoint_timeout = '3min';"
 "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
 
 "${PSQL_PRIMARY[@]}" -At > "$tmpdir/set_gucs.json" <<'EOF'
@@ -147,6 +173,7 @@ echo 3 | sudo tee /proc/sys/vm/drop_caches
 "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
 
 "${PSQL_PRIMARY[@]}" -c "SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared('io')"
+"${PSQL_PRIMARY[@]}" -c "SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared('wal')"
 
 "${PSQL_PRIMARY[@]}" \
     -c "SELECT pg_stat_force_next_flush(); SELECT * FROM pg_stat_io; " \
@@ -233,6 +260,9 @@ db_size_post_load_post_run=$("${PSQL_PRIMARY[@]}" \
     "SELECT pg_database_size('${pgbench[db]}')" \
 )
 
+pg_stat_wal_after=$("${PSQL_PRIMARY[@]}" -d "$DB" -At -c "select row_to_json(pg_stat_wal) from pg_stat_wal")
+pg_stat_io_after=$("${PSQL_PRIMARY[@]}" -d "$DB" -At -c "select row_to_json(pg_stat_io) from pg_stat_io" | jq -s .)
+
 postgres_version="$("${PSQL_PRIMARY[@]}" \
     -At -c 'SELECT version();')"
 
@@ -298,8 +328,13 @@ jq -nf /dev/stdin \
   --arg pidstat_procname "$process_name" \
   --arg build_sha "$build_sha" \
   --arg compile_options "$compile_options" \
+  --arg build_debug "$build_debug" \
+  --arg build_cassert "$build_cassert" \
   --arg copy_table_size_after "$copy_table_size_after" \
   --arg cpufreq_governor "$cpufreq_governor" \
+  --argjson pg_stat_io_after "$pg_stat_io_after" \
+  --argjson pg_stat_wal_after "$pg_stat_wal_after" \
+  --arg huge_pages_size_kb "$huge_pages_size_kb" \
   > "$output_filename" \
 <<'EOF'
   {
@@ -309,6 +344,7 @@ jq -nf /dev/stdin \
         instance: {
           hostinfo: $hostinfo,
           mem_total_bytes: $mem_total_bytes | tonumber,
+          huge_pages_size_kb: $huge_pages_size_kb | tonumber,
           ncpu: $ncpu | tonumber,
           cpufreq_governor: $cpufreq_governor,
         },
@@ -322,6 +358,8 @@ jq -nf /dev/stdin \
         build: {
           sha: $build_sha,
           compile_options: $compile_options,
+          debug: $build_debug,
+          assert: $build_cassert,
         },
         data_directory: $data_directory,
         init: $init | tonumber,
@@ -355,6 +393,8 @@ jq -nf /dev/stdin \
       },
       post_load_post_run: {
         db_size: $db_size_post_load_post_run | tonumber,
+        pg_stat_io: $pg_stat_io_after,
+        pg_stat_wal: $pg_stat_wal_after,
       },
     },
   }
