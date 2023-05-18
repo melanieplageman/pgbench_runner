@@ -132,6 +132,11 @@ else
   "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
 fi
 
+# Create pg_prewarm extension
+if [ "$pgbench_prewarm" -eq 1 ] ; then
+  "${PSQL_PRIMARY[@]}" -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm"
+fi
+
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = '${var_backend_flush_after}';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_wal_size = '30GB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_connections = 500;"
@@ -201,6 +206,11 @@ db_size_post_load_pre_run=$("${PSQL_PRIMARY[@]}" \
     &> "$tmpdir/pg_stat_io_post_load_pre_run"
 
 "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
+
+# Pre-warm the database
+if [ "$pgbench_prewarm" -eq 1 ] ; then
+  "${PSQL_PRIMARY[@]}" -c "SELECT pg_prewarm(oid::regclass, 'buffer'), relname FROM pg_class WHERE relname LIKE 'pgbench%'"
+fi
 
 # Dirty writeback
 ./meminfo.sh &
@@ -335,6 +345,7 @@ jq -nf /dev/stdin \
   --argjson pg_stat_io_after "$pg_stat_io_after" \
   --argjson pg_stat_wal_after "$pg_stat_wal_after" \
   --arg huge_pages_size_kb "$huge_pages_size_kb" \
+  --arg pgbench_prewarm "$pgbench_prewarm" \
   > "$output_filename" \
 <<'EOF'
   {
@@ -364,6 +375,7 @@ jq -nf /dev/stdin \
         data_directory: $data_directory,
         init: $init | tonumber,
         load_data: $load_data | tonumber,
+        pgbench_prewarm: $pgbench_prewarm | tonumber,
         gucs: $set_gucs[0],
       },
       benchmark: {
