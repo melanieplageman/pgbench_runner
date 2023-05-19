@@ -29,8 +29,18 @@ pgbench_prewarm=0
 
 pgbench[builtin_script]=tpcb-like
 
+copy_from_source_filename=""
+copy_from_source_file_info=""
 if [ "$do_custom_ddl" -eq 1 ] ; then
-  pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy.sql
+  # pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy1.sql
+
+  copy_from_source_filename="/tmp/tiny_copytest_data.copy"
+  pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy3.sql
+
+  # copy_from_source_filename="/tmp/copytest_data.copy"
+  # pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy2.sql
+
+  copy_from_source_file_info="$(stat -c '{"filename":"%n","size":%s}' "$copy_from_source_filename" | jq .)"
 fi
 
 for key in "${!pgbench[@]}"; do
@@ -370,6 +380,7 @@ jq -nf /dev/stdin \
   --arg cpufreq_governor "$cpufreq_governor" \
   --argjson pg_stat_io_after "$pg_stat_io_after" \
   --argjson pg_stat_wal_after "$pg_stat_wal_after" \
+  --argjson copy_from_source_file_info "$copy_from_source_file_info" \
   --arg huge_pages_size_kb "$huge_pages_size_kb" \
   --arg pgbench_prewarm "$pgbench_prewarm" \
   > "$output_filename" \
@@ -407,6 +418,7 @@ jq -nf /dev/stdin \
       benchmark: {
         name: "pgbench",
         config: $pgbench_config[0],
+        copy_from_source_file_info: $copy_from_source_file_info,
       },
     },
     data: {
