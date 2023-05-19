@@ -11,7 +11,7 @@ PRIMARY_INSTALLDIR="/home/mplageman/code/pginstall1/bin"
 PRIMARY_BUILDDIR="/home/mplageman/code/pgbuild1"
 SOURCEDIR="/home/mplageman/code/pgsource"
 PRIMARY_LOGFILE="/tmp/logfile"
-DB="postgres"
+DB="test"
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PSQL_PRIMARY=("${PRIMARY_INSTALLDIR}/psql" -p "$PRIMARY_PORT" -d "$DB")
 
@@ -24,6 +24,8 @@ init=1
 load_data=1
 do_custom_ddl=0
 process_name=checkpointer
+pgbench_prewarm=0
+
 
 pgbench[builtin_script]=tpcb-like
 
@@ -127,15 +129,11 @@ if [ $init -eq 1 ]; then
 
   # When re-init'ing the cluster, we must create the test database, even if
   # load-data was not specified, otherwise it won't exist to run pgbench
-  ${PRIMARY_INSTALLDIR}/createdb --port "${PRIMARY_PORT}" "{pgbench[db]}"
+  ${PRIMARY_INSTALLDIR}/createdb --port "${PRIMARY_PORT}" "${pgbench[db]}"
 else
   "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
 fi
 
-# Create pg_prewarm extension
-if [ "$pgbench_prewarm" -eq 1 ] ; then
-  "${PSQL_PRIMARY[@]}" -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm"
-fi
 
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = '${var_backend_flush_after}';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_wal_size = '30GB';"
@@ -160,15 +158,30 @@ killall iostat 2> /dev/null || true
 if [ "$load_data" -eq 1 ] ; then
   ${PRIMARY_INSTALLDIR}/dropdb \
     --port "${PRIMARY_PORT}" \
-    --if-exists "{pgbench[db]}"
+    --if-exists "${pgbench[db]}"
 
   ${PRIMARY_INSTALLDIR}/createdb \
     --port "${PRIMARY_PORT}" \
-    "{pgbench[db]}"
+    "${pgbench[db]}"
+fi
+
+# Create pg_prewarm extension
+if [ "$pgbench_prewarm" -eq 1 ] ; then
+  "${PSQL_PRIMARY[@]}" -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm"
 fi
 
 if [ "$do_custom_ddl" -eq 1 ] ; then
-  "${PSQL_PRIMARY[@]}" -f /home/mplageman/code/pgbench_runner/small_copy_ddl.sql
+  client="${pgbench[client]}"
+
+  "${PSQL_PRIMARY[@]}" -v client="$client" <<'EOF'
+    SELECT 'BEGIN;'
+    UNION ALL
+    SELECT format('DROP TABLE IF EXISTS %1$s; CREATE TABLE %1$s(data text not null)', 'copytest_'||g.i)
+      FROM generate_series(0, :client) g(i)
+    UNION ALL
+    SELECT 'COMMIT;'; \gexec
+EOF
+  # "${PSQL_PRIMARY[@]}" -f /home/mplageman/code/pgbench_runner/small_copy1_ddl.sql
 fi
 
 # Make sure OS cache doesn't have any of our data handy
@@ -189,11 +202,11 @@ if [ "$load_data" -eq 1 ] ; then
     --port=${PRIMARY_PORT} \
     -i -s "${pgbench[scale]}" \
     "${pgbench[db]}" \
-    &> "$tmpdir/pgbench_load.raw"
+    &> "$tmpdir/pgbench_load_summary.raw"
 
-  python3 /home/mplageman/code/pgbench_runner/pgbench_parse_load.py "$tmpdir/pgbench_load.raw" > "$tmpdir/pgbench_load.json"
+  python3 /home/mplageman/code/pgbench_runner/pgbench_parse_load_summary.py "$tmpdir/pgbench_load_summary.raw" > "$tmpdir/pgbench_load_summary.json"
 else
-  jq -n '"skipped"' > "$tmpdir/pgbench_load.json"
+  jq -n '"skipped"' > "$tmpdir/pgbench_load_summary.json"
 fi
 
 db_size_post_load_pre_run=$("${PSQL_PRIMARY[@]}" \
@@ -209,7 +222,7 @@ db_size_post_load_pre_run=$("${PSQL_PRIMARY[@]}" \
 
 # Pre-warm the database
 if [ "$pgbench_prewarm" -eq 1 ] ; then
-  "${PSQL_PRIMARY[@]}" -c "SELECT pg_prewarm(oid::regclass, 'buffer'), relname FROM pg_class WHERE relname LIKE 'pgbench%'"
+  "${PSQL_PRIMARY[@]}" -c "SELECT pg_prewarm(oid::regclass), relname FROM pg_class WHERE relname LIKE 'pgbench%'"
 fi
 
 # Dirty writeback
@@ -220,27 +233,40 @@ meminfo_pid=$!
 S_TIME_FORMAT=ISO iostat -t -y -o JSON -x 1 "$device_name" > iostat.json &
 iostat_pid=$!
 
+# TODO: add a check that only one pid is returned by pgrep so that this actually works
 # pidstat
 pidstat -p $(pgrep -f "$process_name") -d -h -H -l 1 > pidstat_"$process_name".raw &
 pidstat_pid=$!
 
+# TODO: add time command
 # TODO: parse out scheduler name
 if [ "$do_custom_ddl" -eq 1 ] ; then
   # TODO: add weights for each script to config info
+  # "${PRIMARY_INSTALLDIR}/pgbench" \
+  #     --port=${PRIMARY_PORT} \
+  #     --progress-timestamp \
+  #     -c "${pgbench[client]}" \
+  #     -j "${pgbench[client]}" \
+  #     -T "${pgbench[time]}" \
+  #     -P1 \
+  #     --random-seed=0 \
+  #     --file=${pgbench[custom_filename]}@2 \
+  #     --builtin=${pgbench[builtin_script]}@1 \
+  #     "${pgbench[db]}" \
+  #     > "$tmpdir/pgbench_run_summary.raw" \
+  #     2> "$tmpdir/pgbench_run_progress.raw"
+
   "${PRIMARY_INSTALLDIR}/pgbench" \
       --port=${PRIMARY_PORT} \
       --progress-timestamp \
-      -M prepared \
       -c "${pgbench[client]}" \
       -j "${pgbench[client]}" \
       -T "${pgbench[time]}" \
       -P1 \
-      --random-seed=0 \
-      --file=${pgbench[custom_filename]}@2 \
-      --builtin=${pgbench[builtin_script]}@1 \
+      --file=${pgbench[custom_filename]} \
       "${pgbench[db]}" \
-      > "$tmpdir/pgbench_summary.raw" \
-      2> "$tmpdir/pgbench_progress.raw"
+      > "$tmpdir/pgbench_run_summary.raw" \
+      2> "$tmpdir/pgbench_run_progress.raw"
 else
   "${PRIMARY_INSTALLDIR}/pgbench" \
       --port=${PRIMARY_PORT} \
@@ -253,8 +279,8 @@ else
       --random-seed=0 \
       --builtin=${pgbench[builtin_script]} \
       "${pgbench[db]}" \
-      > "$tmpdir/pgbench_summary.raw" \
-      2> "$tmpdir/pgbench_progress.raw"
+      > "$tmpdir/pgbench_run_summary.raw" \
+      2> "$tmpdir/pgbench_run_progress.raw"
 fi
 
 
@@ -278,8 +304,8 @@ postgres_version="$("${PSQL_PRIMARY[@]}" \
 
 cp "$PRIMARY_LOGFILE" "$tmpdir/logfile_after"
 
-python3 /home/mplageman/code/pgbench_runner/pgbench_parse_progress.py "$tmpdir/pgbench_progress.raw" > "$tmpdir/pgbench_progress.json"
-python3 /home/mplageman/code/pgbench_runner/pgbench_parse_summary.py "$tmpdir/pgbench_summary.raw" > "$tmpdir/pgbench_summary.json"
+python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_progress.py "$tmpdir/pgbench_run_progress.raw" > "$tmpdir/pgbench_run_progress.json"
+python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_summary.py "$tmpdir/pgbench_run_summary.raw" > "$tmpdir/pgbench_run_summary.json"
 
 # Parse iostat output
 cp iostat.json "$tmpdir/iostat.raw"
@@ -289,7 +315,7 @@ copy_table_size_after=0
 
 if [ "$do_custom_ddl" -eq 1 ] ; then
   copy_table_size_after="$("${PSQL_PRIMARY[@]}" \
-      -At -c "SELECT pg_total_relation_size('test_copy');")"
+      -At -c "SELECT sum(pg_total_relation_size(relname::regclass)) FROM pg_class WHERE relname LIKE 'copytest%';")"
 fi
 
 # Parse pidstat output
@@ -328,10 +354,10 @@ jq -nf /dev/stdin \
   --arg db_size_post_load_pre_run "$db_size_post_load_pre_run" \
   --arg db_size_post_load_post_run "$db_size_post_load_post_run" \
   --arg mem_total_bytes "$mem_total_bytes" \
-  --slurpfile pgbench_load "$tmpdir/pgbench_load.json" \
+  --slurpfile pgbench_load_summary "$tmpdir/pgbench_load_summary.json" \
   --slurpfile block_device_settings "$tmpdir/block_device_settings.json" \
-  --slurpfile pgbench_progress "$tmpdir/pgbench_progress.json" \
-  --slurpfile pgbench_summary "$tmpdir/pgbench_summary.json" \
+  --slurpfile pgbench_run_progress "$tmpdir/pgbench_run_progress.json" \
+  --slurpfile pgbench_run_summary "$tmpdir/pgbench_run_summary.json" \
   --slurpfile meminfo "meminfo.json" \
   --slurpfile iostat "$tmpdir/iostat.json" \
   --slurpfile pidstat_data pidstat_"${process_name}".json \
@@ -385,10 +411,7 @@ jq -nf /dev/stdin \
     },
     data: {
       pgbench: {
-        load: $pgbench_load[0],
-        progress: $pgbench_progress[0],
-        summary: $pgbench_summary[0],
-        copy_table_size_after: $copy_table_size_after | tonumber,
+        progress: $pgbench_run_progress[0],
       },
       meminfo: $meminfo[0],
       iostat: $iostat[0],
@@ -402,9 +425,12 @@ jq -nf /dev/stdin \
     stats: {
       post_load_pre_run: {
         db_size: $db_size_post_load_pre_run | tonumber,
+        pgbench_load_summary: $pgbench_load_summary[0],
       },
       post_load_post_run: {
         db_size: $db_size_post_load_post_run | tonumber,
+        pgbench_run_summary: $pgbench_run_summary[0],
+        copy_table_size_after: $copy_table_size_after | tonumber,
         pg_stat_io: $pg_stat_io_after,
         pg_stat_wal: $pg_stat_wal_after,
       },
