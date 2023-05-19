@@ -151,6 +151,7 @@ fi
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_prepared_transactions = 1000;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET track_io_timing=on;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET log_checkpoints = on;"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET wal_buffers = '1GB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET huge_pages = '$postgres_huge_pages';"
 
 # "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = 0;"
@@ -248,6 +249,18 @@ iostat_pid=$!
 pidstat -p $(pgrep -f "$process_name") -d -h -H -l 1 > pidstat_"$process_name".raw &
 pidstat_pid=$!
 
+# watch pg_stat_wal
+"${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/pg_stat_wal_progress.raw"
+  SELECT NOW() AS ts, * FROM pg_stat_wal LIMIT 0;
+EOF
+
+"${PSQL_PRIMARY[@]}" -At >> "$tmpdir/pg_stat_wal_progress.raw" -f- <<EOF &
+  SELECT NOW() AS ts, * FROM pg_stat_wal;
+  \watch 1
+EOF
+pg_stat_wal_progress_pid=$!
+
+
 # TODO: add time command
 # TODO: parse out scheduler name
 if [ "$do_custom_ddl" -eq 1 ] ; then
@@ -294,7 +307,7 @@ else
 fi
 
 
-kill -INT $iostat_pid $pidstat_pid
+kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid
 kill $meminfo_pid
 
 "${PSQL_PRIMARY[@]}" \
@@ -316,6 +329,7 @@ cp "$PRIMARY_LOGFILE" "$tmpdir/logfile_after"
 
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_progress.py "$tmpdir/pgbench_run_progress.raw" > "$tmpdir/pgbench_run_progress.json"
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_summary.py "$tmpdir/pgbench_run_summary.raw" > "$tmpdir/pgbench_run_summary.json"
+python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_wal_progress.raw" > "$tmpdir/pg_stat_wal_progress.json"
 
 # Parse iostat output
 cp iostat.json "$tmpdir/iostat.raw"
@@ -370,6 +384,7 @@ jq -nf /dev/stdin \
   --slurpfile pgbench_run_summary "$tmpdir/pgbench_run_summary.json" \
   --slurpfile meminfo "meminfo.json" \
   --slurpfile iostat "$tmpdir/iostat.json" \
+  --slurpfile pg_stat_wal_progress "$tmpdir/pg_stat_wal_progress.json" \
   --slurpfile pidstat_data pidstat_"${process_name}".json \
   --arg pidstat_procname "$process_name" \
   --arg build_sha "$build_sha" \
@@ -427,6 +442,7 @@ jq -nf /dev/stdin \
       },
       meminfo: $meminfo[0],
       iostat: $iostat[0],
+      walstat: $pg_stat_wal_progress[0],
       pidstat: [
         {
           name: $pidstat_procname,
