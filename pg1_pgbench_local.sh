@@ -5,7 +5,7 @@ set -x
 set -v
 
 PRIMARY_PORT=5432
-PRIMARY_DATADIR_ROOT="/mnt/slow"
+PRIMARY_DATADIR_ROOT="/mnt/sabrent"
 PRIMARY_DATADIR="$PRIMARY_DATADIR_ROOT/pgdata"
 PRIMARY_INSTALLDIR="/home/mplageman/code/pginstall1/bin"
 PRIMARY_BUILDDIR="/home/mplageman/code/pgbuild1"
@@ -22,7 +22,8 @@ declare -A pgbench=([db]=${DB} [time]=10 [client]=10 [scale]=10)
 
 init=1
 load_data=1
-do_custom_ddl=0
+do_custom_ddl=1
+mixed_workload=0
 process_name=checkpointer
 pgbench_prewarm=0
 
@@ -34,11 +35,11 @@ copy_from_source_file_info=""
 if [ "$do_custom_ddl" -eq 1 ] ; then
   # pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy1.sql
 
-  copy_from_source_filename="/tmp/tiny_copytest_data.copy"
-  pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy3.sql
+  # copy_from_source_filename="/tmp/tiny_copytest_data.copy"
+  # pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy3.sql
 
-  # copy_from_source_filename="/tmp/copytest_data.copy"
-  # pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy2.sql
+  copy_from_source_filename="/tmp/copytest_data.copy"
+  pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy2.sql
 
   copy_from_source_file_info="$(stat -c '{"filename":"%n","size":%s}' "$copy_from_source_filename" | jq .)"
 fi
@@ -265,31 +266,33 @@ pg_stat_wal_progress_pid=$!
 # TODO: parse out scheduler name
 if [ "$do_custom_ddl" -eq 1 ] ; then
   # TODO: add weights for each script to config info
-  # "${PRIMARY_INSTALLDIR}/pgbench" \
-  #     --port=${PRIMARY_PORT} \
-  #     --progress-timestamp \
-  #     -c "${pgbench[client]}" \
-  #     -j "${pgbench[client]}" \
-  #     -T "${pgbench[time]}" \
-  #     -P1 \
-  #     --random-seed=0 \
-  #     --file=${pgbench[custom_filename]}@2 \
-  #     --builtin=${pgbench[builtin_script]}@1 \
-  #     "${pgbench[db]}" \
-  #     > "$tmpdir/pgbench_run_summary.raw" \
-  #     2> "$tmpdir/pgbench_run_progress.raw"
-
-  "${PRIMARY_INSTALLDIR}/pgbench" \
-      --port=${PRIMARY_PORT} \
-      --progress-timestamp \
-      -c "${pgbench[client]}" \
-      -j "${pgbench[client]}" \
-      -T "${pgbench[time]}" \
-      -P1 \
-      --file=${pgbench[custom_filename]} \
-      "${pgbench[db]}" \
-      > "$tmpdir/pgbench_run_summary.raw" \
-      2> "$tmpdir/pgbench_run_progress.raw"
+  if [ "$mixed_workload" -eq 1 ]; then
+    "${PRIMARY_INSTALLDIR}/pgbench" \
+        --port=${PRIMARY_PORT} \
+        --progress-timestamp \
+        -c "${pgbench[client]}" \
+        -j "${pgbench[client]}" \
+        -t "${pgbench[transactions]}" \
+        -P1 \
+        --random-seed=0 \
+        --file=${pgbench[custom_filename]}@2 \
+        --builtin=${pgbench[builtin_script]}@1 \
+        "${pgbench[db]}" \
+        > "$tmpdir/pgbench_run_summary.raw" \
+        2> "$tmpdir/pgbench_run_progress.raw"
+  else
+    "${PRIMARY_INSTALLDIR}/pgbench" \
+        --port=${PRIMARY_PORT} \
+        --progress-timestamp \
+        -c "${pgbench[client]}" \
+        -j "${pgbench[client]}" \
+        -T "${pgbench[time]}" \
+        -P1 \
+        --file=${pgbench[custom_filename]} \
+        "${pgbench[db]}" \
+        > "$tmpdir/pgbench_run_summary.raw" \
+        2> "$tmpdir/pgbench_run_progress.raw"
+  fi
 else
   "${PRIMARY_INSTALLDIR}/pgbench" \
       --port=${PRIMARY_PORT} \
@@ -398,6 +401,7 @@ jq -nf /dev/stdin \
   --argjson copy_from_source_file_info "$copy_from_source_file_info" \
   --arg huge_pages_size_kb "$huge_pages_size_kb" \
   --arg pgbench_prewarm "$pgbench_prewarm" \
+  --arg mixed_workload "$mixed_workload" \
   > "$output_filename" \
 <<'EOF'
   {
@@ -434,6 +438,7 @@ jq -nf /dev/stdin \
         name: "pgbench",
         config: $pgbench_config[0],
         copy_from_source_file_info: $copy_from_source_file_info,
+        mixed_workload: $mixed_workload,
       },
     },
     data: {
