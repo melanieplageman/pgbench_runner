@@ -32,20 +32,24 @@ pgbench[builtin_script]=tpcb-like
 
 copy_from_source_filename=""
 copy_from_source_file_info=""
+pgbench[custom_filename]=""
 if [ "$do_custom_ddl" -eq 1 ] ; then
   # pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy1.sql
 
-  # copy_from_source_filename="/tmp/tiny_copytest_data.copy"
-  # pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy3.sql
+  copy_from_source_filename="/tmp/tiny_copytest_data.copy"
+  pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy3.sql
+  if [ "$mixed_workload" -eq 0 ] ; then
+    pgbench[builtin_script]=""
+  fi
 
-  copy_from_source_filename="/tmp/copytest_data.copy"
-  pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy2.sql
+  # copy_from_source_filename="/tmp/copytest_data.copy"
+  # pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy2.sql
 
   copy_from_source_file_info="$(stat -c '{"filename":"%n","size":%s}' "$copy_from_source_filename" | jq .)"
 fi
 
 for key in "${!pgbench[@]}"; do
-  if [[ "$key" == "scale" || "$key" == "client" || "$key" == "time" ]] ; then
+  if [[ "$key" == "scale" || "$key" == "client" || "$key" == "time" || "$key" == "transactions" ]] ; then
     jq -n --arg key "$key" --arg value "${pgbench[$key]}" '{ ($key): $value | tonumber }'
   else
     jq -n --arg key "$key" --arg value "${pgbench[$key]}" '{ ($key): $value }'
@@ -261,6 +265,17 @@ EOF
 EOF
 pg_stat_wal_progress_pid=$!
 
+# watch pg_stat_io checkpointer
+"${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/pg_stat_io_checkpointer_progress.raw"
+  SELECT NOW() AS ts, * FROM pg_stat_io LIMIT 0;
+EOF
+
+"${PSQL_PRIMARY[@]}" -At >> "$tmpdir/pg_stat_io_checkpointer_progress.raw" -f- <<EOF &
+  SELECT NOW() AS ts, * FROM pg_stat_io WHERE backend_type = 'checkpointer';
+  \watch 1
+EOF
+pg_stat_io_checkpointer_progress_pid=$!
+
 
 # TODO: add time command
 # TODO: parse out scheduler name
@@ -310,7 +325,7 @@ else
 fi
 
 
-kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid
+kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid $pg_stat_io_checkpointer_progress_pid
 kill $meminfo_pid
 
 "${PSQL_PRIMARY[@]}" \
@@ -333,6 +348,7 @@ cp "$PRIMARY_LOGFILE" "$tmpdir/logfile_after"
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_progress.py "$tmpdir/pgbench_run_progress.raw" > "$tmpdir/pgbench_run_progress.json"
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_summary.py "$tmpdir/pgbench_run_summary.raw" > "$tmpdir/pgbench_run_summary.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_wal_progress.raw" > "$tmpdir/pg_stat_wal_progress.json"
+python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_io_checkpointer_progress.raw" > "$tmpdir/pg_stat_io_checkpointer_progress.json"
 
 # Parse iostat output
 cp iostat.json "$tmpdir/iostat.raw"
@@ -388,6 +404,7 @@ jq -nf /dev/stdin \
   --slurpfile meminfo "meminfo.json" \
   --slurpfile iostat "$tmpdir/iostat.json" \
   --slurpfile pg_stat_wal_progress "$tmpdir/pg_stat_wal_progress.json" \
+  --slurpfile pg_stat_io_checkpointer_progress "$tmpdir/pg_stat_io_checkpointer_progress.json" \
   --slurpfile pidstat_data pidstat_"${process_name}".json \
   --arg pidstat_procname "$process_name" \
   --arg build_sha "$build_sha" \
@@ -448,6 +465,7 @@ jq -nf /dev/stdin \
       meminfo: $meminfo[0],
       iostat: $iostat[0],
       walstat: $pg_stat_wal_progress[0],
+      iocheckpointerstat: $pg_stat_io_checkpointer_progress[0],
       pidstat: [
         {
           name: $pidstat_procname,
