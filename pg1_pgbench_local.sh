@@ -18,20 +18,27 @@ PSQL_PRIMARY=("${PRIMARY_INSTALLDIR}/psql" -p "$PRIMARY_PORT" -d "$DB")
 mkdir -p /tmp/pgresults
 tmpdir="$(mktemp -d -p /tmp/pgresults 2> /dev/null)"
 
-declare -A pgbench=([db]=${DB} [time]=10 [client]=10 [scale]=10)
+var_scale=$1
+var_backend_flush_after=$2
+var_shared_buffers=$3
+
+# Time should be in seconds so parsing works
+# declare -A pgbench=([db]=${DB} [time]=60 [client]=10 [scale]=${var_scale})
+# declare -A pgbench=([db]=${DB} [time]=1000 [client]=100 [scale]=${var_scale})
+# declare -A pgbench=([db]=${DB} [transactions]=1000 [time]=300 [client]=16 [scale]=${var_scale})
+declare -A pgbench=([db]=${DB} [transactions]=2000 [time]=30 [client]=16 [scale]=${var_scale})
 
 init=1
 load_data=1
-do_custom_ddl=1
+do_custom_ddl=0
 mixed_workload=0
 process_name=checkpointer
 pgbench_prewarm=0
 
-
 pgbench[builtin_script]=tpcb-like
 
 copy_from_source_filename=""
-copy_from_source_file_info=""
+copy_from_source_file_info="{}"
 pgbench[custom_filename]=""
 if [ "$do_custom_ddl" -eq 1 ] ; then
   # pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy1.sql
@@ -77,9 +84,9 @@ shared_buffers_kb=$(echo "$var_shared_buffers * 8" | bc)
 enough_hugepages=$(echo "($shared_buffers_kb / $huge_pages_size_kb) + 5" | bc)
 
 postgres_huge_pages="off"
-if [ $huge_pages_free -gt $enough_hugepages ]; then
-  postgres_huge_pages="on"
-fi
+# if [ $huge_pages_free -gt $enough_hugepages ]; then
+#   postgres_huge_pages="on"
+# fi
 
 # Get NCPUS
 ncpus=$(lscpu -J | jq '.lscpu | .[] | select(.field == "CPU(s):") | .data | tonumber')
@@ -94,7 +101,10 @@ build_sha=$(git --git-dir=$SOURCEDIR/.git --work-tree=$SOURCEDIR rev-parse --sho
 
 filesystem_info=$(findmnt -J "$PRIMARY_DATADIR_ROOT" | jq '.filesystems[0]')
 device_name=$(jq -r '.source' <<< "$filesystem_info")
+# Something with jq to get the name when I use /dev/mapper
+# lsblk -Jpo NAME,MOUNTPOINT,PKNAME | jq -r '.blockdevices[] | select(.name == "/dev/sda") | .children[] | .children[] | .pkname'
 small_device_name=$(lsblk -no pkname $device_name)
+
 declare -A block_device_settings=(
   [nr_requests]=$(cat /sys/block/$small_device_name/queue/nr_requests)
   [scheduler]=$(cat /sys/block/$small_device_name/queue/scheduler)
@@ -138,7 +148,7 @@ if [ $init -eq 1 ]; then
 
   rm -rf $PRIMARY_DATADIR/*
 
-  "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -l "$PRIMARY_LOGFILE" init
+  "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -l "$PRIMARY_LOGFILE" init -o "--wal-segsize=16"
   "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" start
   "${PRIMARY_INSTALLDIR}/createdb" -p "$PRIMARY_PORT"
 
@@ -149,9 +159,11 @@ else
   "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
 fi
 
-
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '3ms';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET wal_compression = 'off';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = '${var_backend_flush_after}';"
-"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_wal_size = '30GB';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_wal_size = '60GB';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET min_wal_size = '10GB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_connections = 500;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_prepared_transactions = 1000;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET track_io_timing=on;"
@@ -301,7 +313,7 @@ if [ "$do_custom_ddl" -eq 1 ] ; then
         --progress-timestamp \
         -c "${pgbench[client]}" \
         -j "${pgbench[client]}" \
-        -T "${pgbench[time]}" \
+        -t "${pgbench[transactions]}" \
         -P1 \
         --file=${pgbench[custom_filename]} \
         "${pgbench[db]}" \
