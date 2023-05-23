@@ -34,6 +34,7 @@ do_custom_ddl=0
 mixed_workload=0
 process_name=checkpointer
 pgbench_prewarm=0
+do_buffercache=0
 
 pgbench[builtin_script]=tpcb-like
 
@@ -159,9 +160,10 @@ else
   "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
 fi
 
-"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '3ms';"
+
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '2ms';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET wal_compression = 'off';"
-"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = '${var_backend_flush_after}';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = '1MB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_wal_size = '60GB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET min_wal_size = '10GB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_connections = 500;"
@@ -300,6 +302,29 @@ EOF
 EOF
 pg_stat_io_checkpointer_progress_pid=$!
 
+# watch pg_stat_io normal backend
+"${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/pg_stat_io_backend_normal_perm_progress.raw"
+  SELECT NOW() AS ts, * FROM pg_stat_io LIMIT 0;
+EOF
+
+"${PSQL_PRIMARY[@]}" -At >> "$tmpdir/pg_stat_io_backend_normal_perm_progress.raw" -f- <<EOF &
+  SELECT NOW() AS ts, * FROM pg_stat_io WHERE backend_type = 'client backend' and context = 'normal' and object = 'relation';
+  \watch 1
+EOF
+pg_stat_io_backend_normal_perm_progress_pid=$!
+
+"${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/buffercache_progress.raw"
+  SELECT NOW() AS ts, * FROM pg_buffercache_summary() LIMIT 1;
+EOF
+# watch pg_buffercache_summary()
+if [ "$do_buffercache" -eq 1 ]; then
+"${PSQL_PRIMARY[@]}" -At >> "$tmpdir/buffercache_progress.raw" -f- <<EOF &
+  SELECT NOW() AS ts, * FROM pg_buffercache_summary();
+  \watch 5
+EOF
+buffercache_progress_pid=$!
+fi
+
 
 # TODO: add time command
 # TODO: parse out scheduler name
@@ -350,7 +375,11 @@ fi
 
 
 kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid $pg_stat_io_checkpointer_progress_pid $pg_stat_activity_vacuumdelay_pid
+kill -INT $pg_stat_io_backend_normal_perm_progress_pid
 kill $meminfo_pid
+if [ "$do_buffercache" -eq 1 ]; then
+  kill -INT $buffercache_progress_pid
+fi
 
 "${PSQL_PRIMARY[@]}" \
     -c "SELECT pg_stat_force_next_flush(); SELECT * FROM pg_stat_io;" \
@@ -373,7 +402,9 @@ python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_progress.py "$tmpd
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_summary.py "$tmpdir/pgbench_run_summary.raw" > "$tmpdir/pgbench_run_summary.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_wal_progress.raw" > "$tmpdir/pg_stat_wal_progress.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_io_checkpointer_progress.raw" > "$tmpdir/pg_stat_io_checkpointer_progress.json"
+python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_io_backend_normal_perm_progress.raw" > "$tmpdir/pg_stat_io_backend_normal_perm_progress.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_activity_vacuumdelay.raw" > "$tmpdir/pg_stat_activity_vacuumdelay.json"
+python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/buffercache_progress.raw" > "$tmpdir/buffercache_progress.json"
 
 # Parse iostat output
 cp iostat.json "$tmpdir/iostat.raw"
@@ -430,7 +461,9 @@ jq -nf /dev/stdin \
   --slurpfile iostat "$tmpdir/iostat.json" \
   --slurpfile pg_stat_wal_progress "$tmpdir/pg_stat_wal_progress.json" \
   --slurpfile pg_stat_io_checkpointer_progress "$tmpdir/pg_stat_io_checkpointer_progress.json" \
+  --slurpfile pg_stat_io_backend_normal_perm_progress "$tmpdir/pg_stat_io_backend_normal_perm_progress.json" \
   --slurpfile pg_stat_activity_vacuumdelay "$tmpdir/pg_stat_activity_vacuumdelay.json" \
+  --slurpfile pg_buffercache_progress "$tmpdir/buffercache_progress.json" \
   --slurpfile pidstat_data pidstat_"${process_name}".json \
   --arg pidstat_procname "$process_name" \
   --arg build_sha "$build_sha" \
@@ -492,7 +525,9 @@ jq -nf /dev/stdin \
       iostat: $iostat[0],
       walstat: $pg_stat_wal_progress[0],
       iocheckpointerstat: $pg_stat_io_checkpointer_progress[0],
+      iobackendnormstat: $pg_stat_io_backend_normal_perm_progress[0],
       vacuumdelaywait : $pg_stat_activity_vacuumdelay[0],
+      buffercache: $pg_buffercache_progress[0],
       pidstat: [
         {
           name: $pidstat_procname,
