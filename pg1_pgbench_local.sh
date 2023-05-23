@@ -277,6 +277,18 @@ EOF
 EOF
 pg_stat_wal_progress_pid=$!
 
+# watch pg_stat_activity for vacuum delays
+"${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/pg_stat_activity_vacuumdelay.raw"
+  SELECT NOW() AS ts, null as vacuumdelaywait;
+EOF
+
+"${PSQL_PRIMARY[@]}" -At >> "$tmpdir/pg_stat_activity_vacuumdelay.raw" -f- <<EOF &
+  SELECT NOW() AS ts, EXISTS(SELECT FROM pg_stat_activity WHERE wait_event IS NOT NULL) AS vacuumdelaywait;
+  SELECT NOW() AS ts, EXISTS(SELECT FROM pg_stat_activity WHERE wait_event = 'VacuumDelay') AS vacuumdelaywait;
+  \watch 1
+EOF
+pg_stat_activity_vacuumdelay_pid=$!
+
 # watch pg_stat_io checkpointer
 "${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/pg_stat_io_checkpointer_progress.raw"
   SELECT NOW() AS ts, * FROM pg_stat_io LIMIT 0;
@@ -337,7 +349,7 @@ else
 fi
 
 
-kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid $pg_stat_io_checkpointer_progress_pid
+kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid $pg_stat_io_checkpointer_progress_pid $pg_stat_activity_vacuumdelay_pid
 kill $meminfo_pid
 
 "${PSQL_PRIMARY[@]}" \
@@ -361,6 +373,7 @@ python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_progress.py "$tmpd
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_summary.py "$tmpdir/pgbench_run_summary.raw" > "$tmpdir/pgbench_run_summary.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_wal_progress.raw" > "$tmpdir/pg_stat_wal_progress.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_io_checkpointer_progress.raw" > "$tmpdir/pg_stat_io_checkpointer_progress.json"
+python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_activity_vacuumdelay.raw" > "$tmpdir/pg_stat_activity_vacuumdelay.json"
 
 # Parse iostat output
 cp iostat.json "$tmpdir/iostat.raw"
@@ -417,6 +430,7 @@ jq -nf /dev/stdin \
   --slurpfile iostat "$tmpdir/iostat.json" \
   --slurpfile pg_stat_wal_progress "$tmpdir/pg_stat_wal_progress.json" \
   --slurpfile pg_stat_io_checkpointer_progress "$tmpdir/pg_stat_io_checkpointer_progress.json" \
+  --slurpfile pg_stat_activity_vacuumdelay "$tmpdir/pg_stat_activity_vacuumdelay.json" \
   --slurpfile pidstat_data pidstat_"${process_name}".json \
   --arg pidstat_procname "$process_name" \
   --arg build_sha "$build_sha" \
@@ -478,6 +492,7 @@ jq -nf /dev/stdin \
       iostat: $iostat[0],
       walstat: $pg_stat_wal_progress[0],
       iocheckpointerstat: $pg_stat_io_checkpointer_progress[0],
+      vacuumdelaywait : $pg_stat_activity_vacuumdelay[0],
       pidstat: [
         {
           name: $pidstat_procname,
