@@ -31,6 +31,7 @@ declare -A pgbench=([db]=${DB} [transactions]=2000 [time]=30 [client]=16 [scale]
 init=1
 load_data=1
 do_custom_ddl=0
+use_custom_file=1
 mixed_workload=0
 process_name=checkpointer
 pgbench_prewarm=0
@@ -283,17 +284,21 @@ EOF
 EOF
 pg_stat_wal_progress_pid=$!
 
-# watch pg_stat_activity for vacuum delays
-"${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/pg_stat_activity_vacuumdelay.raw"
-  SELECT NOW() AS ts, null as vacuumdelaywait;
+# watch aggregated wait events
+"${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/aggwaits.raw"
+  SELECT now() AS ts, null as wait_event_type, null as wait_event, null as count FROM pg_stat_activity LIMIT 0;
 EOF
 
-"${PSQL_PRIMARY[@]}" -At >> "$tmpdir/pg_stat_activity_vacuumdelay.raw" -f- <<EOF &
-  SELECT NOW() AS ts, EXISTS(SELECT FROM pg_stat_activity WHERE wait_event IS NOT NULL) AS vacuumdelaywait;
-  SELECT NOW() AS ts, EXISTS(SELECT FROM pg_stat_activity WHERE wait_event = 'VacuumDelay') AS vacuumdelaywait;
+"${PSQL_PRIMARY[@]}" -At >> "$tmpdir/aggwaits.raw" -f- <<EOF &
+  SELECT now() AS ts, wait_event_type, wait_event, count(*)
+  FROM pg_stat_activity
+  WHERE wait_event_type <> 'Activity' AND state <> 'idle' AND state <> 'idle in transaction'
+  GROUP BY wait_event_type, wait_event
+  ORDER BY count(*) DESC;
   \watch 1
 EOF
-pg_stat_activity_vacuumdelay_pid=$!
+aggwaits_pid=$!
+
 
 # watch pg_stat_io checkpointer
 "${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/pg_stat_io_checkpointer_progress.raw"
@@ -376,8 +381,8 @@ else
       2> "$tmpdir/pgbench_run_progress.raw"
 fi
 
-kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid $pg_stat_io_checkpointer_progress_pid $pg_stat_activity_vacuumdelay_pid
-kill -INT $pg_stat_io_backend_normal_perm_progress_pid
+kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid $pg_stat_io_checkpointer_progress_pid
+kill -INT $pg_stat_io_backend_normal_perm_progress_pid $aggwaits_pid
 kill $meminfo_pid
 if [ "$do_buffercache" -eq 1 ]; then
   kill -INT $buffercache_progress_pid
@@ -405,8 +410,8 @@ python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_summary.py "$tmpdi
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_wal_progress.raw" > "$tmpdir/pg_stat_wal_progress.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_io_checkpointer_progress.raw" > "$tmpdir/pg_stat_io_checkpointer_progress.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_io_backend_normal_perm_progress.raw" > "$tmpdir/pg_stat_io_backend_normal_perm_progress.json"
-python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_activity_vacuumdelay.raw" > "$tmpdir/pg_stat_activity_vacuumdelay.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/buffercache_progress.raw" > "$tmpdir/buffercache_progress.json"
+python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/aggwaits.raw" > "$tmpdir/aggwaits.json"
 
 # Parse iostat output
 cp iostat.json "$tmpdir/iostat.raw"
@@ -464,7 +469,7 @@ jq -nf /dev/stdin \
   --slurpfile pg_stat_wal_progress "$tmpdir/pg_stat_wal_progress.json" \
   --slurpfile pg_stat_io_checkpointer_progress "$tmpdir/pg_stat_io_checkpointer_progress.json" \
   --slurpfile pg_stat_io_backend_normal_perm_progress "$tmpdir/pg_stat_io_backend_normal_perm_progress.json" \
-  --slurpfile pg_stat_activity_vacuumdelay "$tmpdir/pg_stat_activity_vacuumdelay.json" \
+  --slurpfile aggwaits "$tmpdir/aggwaits.json" \
   --slurpfile pg_buffercache_progress "$tmpdir/buffercache_progress.json" \
   --slurpfile pidstat_data pidstat_"${process_name}".json \
   --arg pidstat_procname "$process_name" \
@@ -528,7 +533,7 @@ jq -nf /dev/stdin \
       walstat: $pg_stat_wal_progress[0],
       iocheckpointerstat: $pg_stat_io_checkpointer_progress[0],
       iobackendnormstat: $pg_stat_io_backend_normal_perm_progress[0],
-      vacuumdelaywait : $pg_stat_activity_vacuumdelay[0],
+      waits: $aggwaits[0],
       buffercache: $pg_buffercache_progress[0],
       pidstat: [
         {
