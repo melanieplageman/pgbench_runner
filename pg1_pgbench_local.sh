@@ -167,7 +167,7 @@ fi
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_wal_size = '60GB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET min_wal_size = '10GB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_connections = 500;"
-"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_prepared_transactions = 1000;"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM RESET max_prepared_transactions;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET track_io_timing=on;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET log_checkpoints = on;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET wal_buffers = '1GB';"
@@ -200,6 +200,8 @@ if [ "$pgbench_prewarm" -eq 1 ] ; then
   "${PSQL_PRIMARY[@]}" -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm"
 fi
 
+"${PSQL_PRIMARY[@]}" -c "CREATE EXTENSION IF NOT EXISTS pg_buffercache;"
+
 if [ "$do_custom_ddl" -eq 1 ] ; then
   client="${pgbench[client]}"
 
@@ -213,9 +215,6 @@ if [ "$do_custom_ddl" -eq 1 ] ; then
 EOF
   # "${PSQL_PRIMARY[@]}" -f /home/mplageman/code/pgbench_runner/small_copy1_ddl.sql
 fi
-
-# Make sure OS cache doesn't have any of our data handy
-echo 3 | sudo tee /proc/sys/vm/drop_caches
 
 # Restart primary
 "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
@@ -248,7 +247,12 @@ db_size_post_load_pre_run=$("${PSQL_PRIMARY[@]}" \
     -c "SELECT pg_stat_force_next_flush(); SELECT * FROM pg_stat_io;" \
     &> "$tmpdir/pg_stat_io_post_load_pre_run"
 
-"${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
+"${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" stop
+
+# Make sure OS cache doesn't have any of our data handy
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+"${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" start
 
 # Pre-warm the database
 if [ "$pgbench_prewarm" -eq 1 ] ; then
@@ -325,7 +329,6 @@ EOF
 buffercache_progress_pid=$!
 fi
 
-
 # TODO: add time command
 # TODO: parse out scheduler name
 if [ "$do_custom_ddl" -eq 1 ] ; then
@@ -361,7 +364,7 @@ else
   "${PRIMARY_INSTALLDIR}/pgbench" \
       --port=${PRIMARY_PORT} \
       --progress-timestamp \
-      -M prepared \
+      -M "${pgbench[mode]}" \
       -c "${pgbench[client]}" \
       -j "${pgbench[client]}" \
       -T "${pgbench[time]}" \
@@ -372,7 +375,6 @@ else
       > "$tmpdir/pgbench_run_summary.raw" \
       2> "$tmpdir/pgbench_run_progress.raw"
 fi
-
 
 kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid $pg_stat_io_checkpointer_progress_pid $pg_stat_activity_vacuumdelay_pid
 kill -INT $pg_stat_io_backend_normal_perm_progress_pid
