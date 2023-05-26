@@ -19,43 +19,46 @@ mkdir -p /tmp/pgresults
 tmpdir="$(mktemp -d -p /tmp/pgresults 2> /dev/null)"
 
 var_scale=$1
-var_backend_flush_after=$2
-var_shared_buffers=$3
+var_shared_buffers=$2
+var_prewarm=$3
 
 # Time should be in seconds so parsing works
 # declare -A pgbench=([db]=${DB} [time]=60 [client]=10 [scale]=${var_scale})
 # declare -A pgbench=([db]=${DB} [time]=1000 [client]=100 [scale]=${var_scale})
 # declare -A pgbench=([db]=${DB} [transactions]=1000 [time]=300 [client]=16 [scale]=${var_scale})
-declare -A pgbench=([db]=${DB} [transactions]=2000 [time]=30 [client]=16 [scale]=${var_scale})
+declare -A pgbench=([db]=${DB} [transactions]=100000 [time]=30 [client]=1 [scale]=${var_scale})
 
 init=1
 load_data=1
-do_custom_ddl=0
+do_custom_ddl=1
 use_custom_file=1
 mixed_workload=0
 process_name=checkpointer
-pgbench_prewarm=0
-do_buffercache=0
+pgbench_prewarm="$var_prewarm"
+do_buffercache=1
+dmdelay="0"
 
-pgbench[builtin_script]=tpcb-like
+pgbench[mode]='prepared'
+pgbench[transactions]=3
+pgbench[time]=0
+
+# pgbench[builtin_script]=tpcb-like
+pgbench[builtin_script]=""
+pgbench[custom_filename]="large_sequential_scan"
+# pgbench[custom_filename]="insert_default_uuid"
+# pgbench[custom_filename]="insert_ossp_uuid"
+# pgbench[custom_filename]="select_gaussian_param10"
+# pgbench[custom_filename]="select_random"
+# pgbench[custom_filename]="tpcb-like"
+# pgbench[custom_filename]="tpcb-like_gaussian_param10"
 
 copy_from_source_filename=""
 copy_from_source_file_info="{}"
-pgbench[custom_filename]=""
-if [ "$do_custom_ddl" -eq 1 ] ; then
-  # pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy1.sql
-
-  copy_from_source_filename="/tmp/tiny_copytest_data.copy"
-  pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy3.sql
-  if [ "$mixed_workload" -eq 0 ] ; then
-    pgbench[builtin_script]=""
-  fi
-
+# if [ "$do_custom_ddl" -eq 1 ] ; then
+  # copy_from_source_filename="/tmp/tiny_copytest_data.copy"
   # copy_from_source_filename="/tmp/copytest_data.copy"
-  # pgbench[custom_filename]=/home/mplageman/code/pgbench_runner/small_copy2.sql
-
-  copy_from_source_file_info="$(stat -c '{"filename":"%n","size":%s}' "$copy_from_source_filename" | jq .)"
-fi
+  # copy_from_source_file_info="$(stat -c '{"filename":"%n","size":%s}' "$copy_from_source_filename" | jq .)"
+# fi
 
 for key in "${!pgbench[@]}"; do
   if [[ "$key" == "scale" || "$key" == "client" || "$key" == "time" || "$key" == "transactions" ]] ; then
@@ -105,7 +108,10 @@ filesystem_info=$(findmnt -J "$PRIMARY_DATADIR_ROOT" | jq '.filesystems[0]')
 device_name=$(jq -r '.source' <<< "$filesystem_info")
 # Something with jq to get the name when I use /dev/mapper
 # lsblk -Jpo NAME,MOUNTPOINT,PKNAME | jq -r '.blockdevices[] | select(.name == "/dev/sda") | .children[] | .children[] | .pkname'
-small_device_name=$(lsblk -no pkname $device_name)
+# small_device_name=$(lsblk -no pkname $device_name)
+small_device_name=$(lsblk -no name $device_name)
+small_device_name=nvme1n1
+echo $small_device_name
 
 declare -A block_device_settings=(
   [nr_requests]=$(cat /sys/block/$small_device_name/queue/nr_requests)
@@ -162,13 +168,14 @@ else
 fi
 
 
-"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '2ms';"
+# "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET plan_cache_mode = force_generic_plan;"
+# "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '2ms';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET wal_compression = 'off';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = '1MB';"
-"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_wal_size = '60GB';"
-"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET min_wal_size = '10GB';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_wal_size = '150GB';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET min_wal_size = '150GB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_connections = 500;"
-"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM RESET max_prepared_transactions;"
+# "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM RESET max_prepared_transactions;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET track_io_timing=on;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET log_checkpoints = on;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET wal_buffers = '1GB';"
@@ -202,30 +209,13 @@ if [ "$pgbench_prewarm" -eq 1 ] ; then
 fi
 
 "${PSQL_PRIMARY[@]}" -c "CREATE EXTENSION IF NOT EXISTS pg_buffercache;"
-
-if [ "$do_custom_ddl" -eq 1 ] ; then
-  client="${pgbench[client]}"
-
-  "${PSQL_PRIMARY[@]}" -v client="$client" <<'EOF'
-    SELECT 'BEGIN;'
-    UNION ALL
-    SELECT format('DROP TABLE IF EXISTS %1$s; CREATE TABLE %1$s(data text not null)', 'copytest_'||g.i)
-      FROM generate_series(0, :client) g(i)
-    UNION ALL
-    SELECT 'COMMIT;'; \gexec
-EOF
-  # "${PSQL_PRIMARY[@]}" -f /home/mplageman/code/pgbench_runner/small_copy1_ddl.sql
-fi
+"${PSQL_PRIMARY[@]}" -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
 
 # Restart primary
 "${PRIMARY_INSTALLDIR}/pg_ctl" -D "$PRIMARY_DATADIR" -o "-p $PRIMARY_PORT" -l "$PRIMARY_LOGFILE" restart
 
 "${PSQL_PRIMARY[@]}" -c "SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared('io')"
 "${PSQL_PRIMARY[@]}" -c "SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared('wal')"
-
-"${PSQL_PRIMARY[@]}" \
-    -c "SELECT pg_stat_force_next_flush(); SELECT * FROM pg_stat_io; " \
-    &> "$tmpdir/pg_stat_io_pre_load_pre_run"
 
 if [ "$load_data" -eq 1 ] ; then
   "${PRIMARY_INSTALLDIR}/pgbench" \
@@ -237,6 +227,35 @@ if [ "$load_data" -eq 1 ] ; then
   python3 /home/mplageman/code/pgbench_runner/pgbench_parse_load_summary.py "$tmpdir/pgbench_load_summary.raw" > "$tmpdir/pgbench_load_summary.json"
 else
   jq -n '"skipped"' > "$tmpdir/pgbench_load_summary.json"
+fi
+
+if [ "$do_custom_ddl" -eq 1 ] ; then
+  # client="${pgbench[client]}"
+
+#   "${PSQL_PRIMARY[@]}" -v client="$client" <<'EOF'
+#     SELECT 'BEGIN;'
+#     UNION ALL
+#     SELECT format('DROP TABLE IF EXISTS %1$s; CREATE TABLE %1$s(data text not null)', 'copytest_'||g.i)
+#       FROM generate_series(0, :client) g(i)
+#     UNION ALL
+#     SELECT 'COMMIT;'; \gexec
+# EOF
+
+  "${PSQL_PRIMARY[@]}" -c "DROP TABLE IF EXISTS large_select; CREATE TABLE large_select(data TEXT);"
+   "${PSQL_PRIMARY[@]}" -c "COPY large_select FROM '/tmp/copytest_data.copy';"
+   "${PSQL_PRIMARY[@]}" -c "VACUUM (ANALYZE) large_select;"
+
+  # "${PSQL_PRIMARY[@]}" -c "DROP TABLE IF EXISTS flux; CREATE TABLE flux(a int, b int);"
+
+  # "${PSQL_PRIMARY[@]}" -c "DROP TABLE IF EXISTS has_default_uuid; CREATE TABLE has_default_uuid(id uuid default gen_random_uuid() PRIMARY KEY, val TEXT);"
+  # "${PSQL_PRIMARY[@]}" -c "COPY has_default_uuid FROM '/tmp/has_default_uuid.copy';"
+  # "${PSQL_PRIMARY[@]}" -c "VACUUM (ANALYZE) has_default_uuid;"
+  # "${PSQL_PRIMARY[@]}" -c "CHECKPOINT;"
+
+  # "${PSQL_PRIMARY[@]}" -c "DROP TABLE IF EXISTS has_ossp_uuid; CREATE TABLE has_ossp_uuid(id uuid default uuid_generate_v1() PRIMARY KEY, val TEXT);"
+  # "${PSQL_PRIMARY[@]}" -c "COPY has_ossp_uuid FROM '/tmp/has_ossp_uuid.copy';"
+  # "${PSQL_PRIMARY[@]}" -c "VACUUM (ANALYZE) has_ossp_uuid;"
+  # "${PSQL_PRIMARY[@]}" -c "CHECKPOINT;"
 fi
 
 db_size_post_load_pre_run=$("${PSQL_PRIMARY[@]}" \
@@ -299,7 +318,6 @@ EOF
 EOF
 aggwaits_pid=$!
 
-
 # watch pg_stat_io checkpointer
 "${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/pg_stat_io_checkpointer_progress.raw"
   SELECT NOW() AS ts, * FROM pg_stat_io LIMIT 0;
@@ -334,9 +352,42 @@ EOF
 buffercache_progress_pid=$!
 fi
 
+# \set aid random_gaussian(1, 100000 * ${pgbench[scale]}, 10)
+# \set aid random(1, 100000 * ${pgbench[scale]})
+# SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+
+# \set aid random(1,  100000 * ${pgbench[scale]})
+# \set bid random(1,  100000 * ${pgbench[scale]})
+# \set tid random(1,  100000 * ${pgbench[scale]})
+# \set delta random(-5000, 5000)
+
+# \set aid random_gaussian(1, 100000 * ${pgbench[scale]}, 10)
+# \set bid random_gaussian(1, 100000 * ${pgbench[scale]}, 10)
+# \set tid random_gaussian(1, 100000 * ${pgbench[scale]}, 10)
+# \set delta random_gaussian(-5000, 5000, 10)
+
+# UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid;
+# SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+# UPDATE pgbench_tellers SET tbalance = tbalance + :delta WHERE tid = :tid;
+# UPDATE pgbench_branches SET bbalance = bbalance + :delta WHERE bid = :bid;
+# INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP);
+
+## THRASH FLUX
+# insert into flux select :client_id, i from generate_series(1,100)i;
+# delete from flux where a = :client_id;
+
+# small_copy3
+#COPY copytest_:client_id FROM '/tmp/tiny_copytest_data.copy';
+
+# small_copy2
+#COPY copytest_:client_id FROM '/tmp/copytest_data.copy';
+
+#INSERT INTO has_default_uuid(val) select repeat('b', 10);
+# INSERT INTO has_ossp_uuid(val) select repeat('b', 10);
+
 # TODO: add time command
 # TODO: parse out scheduler name
-if [ "$do_custom_ddl" -eq 1 ] ; then
+if [ "$use_custom_file" -eq 1 ] ; then
   # TODO: add weights for each script to config info
   if [ "$mixed_workload" -eq 1 ]; then
     "${PRIMARY_INSTALLDIR}/pgbench" \
@@ -344,7 +395,7 @@ if [ "$do_custom_ddl" -eq 1 ] ; then
         --progress-timestamp \
         -c "${pgbench[client]}" \
         -j "${pgbench[client]}" \
-        -t "${pgbench[transactions]}" \
+        -T "${pgbench[time]}" \
         -P1 \
         --random-seed=0 \
         --file=${pgbench[custom_filename]}@2 \
@@ -353,17 +404,34 @@ if [ "$do_custom_ddl" -eq 1 ] ; then
         > "$tmpdir/pgbench_run_summary.raw" \
         2> "$tmpdir/pgbench_run_progress.raw"
   else
-    "${PRIMARY_INSTALLDIR}/pgbench" \
-        --port=${PRIMARY_PORT} \
-        --progress-timestamp \
-        -c "${pgbench[client]}" \
-        -j "${pgbench[client]}" \
-        -t "${pgbench[transactions]}" \
-        -P1 \
-        --file=${pgbench[custom_filename]} \
-        "${pgbench[db]}" \
-        > "$tmpdir/pgbench_run_summary.raw" \
-        2> "$tmpdir/pgbench_run_progress.raw"
+
+"${PRIMARY_INSTALLDIR}/pgbench" \
+  --port=${PRIMARY_PORT} \
+  --progress-timestamp \
+  -c "${pgbench[client]}" \
+  -j "${pgbench[client]}" \
+  -M "${pgbench[mode]}" \
+  -t "${pgbench[transactions]}" \
+  -P1 \
+  "${pgbench[db]}" \
+  > "$tmpdir/pgbench_run_summary.raw" \
+  2> "$tmpdir/pgbench_run_progress.raw" \
+-f- <<EOF
+SELECT * FROM large_select;
+EOF
+
+    # "${PRIMARY_INSTALLDIR}/pgbench" \
+    #     --port=${PRIMARY_PORT} \
+    #     --progress-timestamp \
+    #     -c "${pgbench[client]}" \
+    #     -j "${pgbench[client]}" \
+    #     -t "${pgbench[transactions]}" \
+    #     -P1 \
+    #     --file=${pgbench[custom_filename]} \
+    #     "${pgbench[db]}" \
+    #     > "$tmpdir/pgbench_run_summary.raw" \
+    #     2> "$tmpdir/pgbench_run_progress.raw"
+
   fi
 else
   "${PRIMARY_INSTALLDIR}/pgbench" \
@@ -420,8 +488,20 @@ jq '.sysstat.hosts[0].statistics' < "$tmpdir/iostat.raw" > "$tmpdir/iostat.json"
 copy_table_size_after=0
 
 if [ "$do_custom_ddl" -eq 1 ] ; then
+  # copy_table_size_after="$("${PSQL_PRIMARY[@]}" \
+  #     -At -c "SELECT sum(pg_total_relation_size(relname::regclass)) FROM pg_class WHERE relname LIKE 'copytest%';")"
+
+  # copy_table_size_after="$("${PSQL_PRIMARY[@]}" \
+  #   -At -c "SELECT pg_total_relation_size('has_ossp_uuid');")"
+
   copy_table_size_after="$("${PSQL_PRIMARY[@]}" \
-      -At -c "SELECT sum(pg_total_relation_size(relname::regclass)) FROM pg_class WHERE relname LIKE 'copytest%';")"
+    -At -c "SELECT pg_total_relation_size('large_select');")"
+
+  # copy_table_size_after="$("${PSQL_PRIMARY[@]}" \
+  #   -At -c "SELECT pg_total_relation_size('has_default_uuid');")"
+
+  # copy_table_size_after="$("${PSQL_PRIMARY[@]}" \
+  #   -At -c "SELECT pg_total_relation_size('flux');")"
 fi
 
 # Parse pidstat output
@@ -485,6 +565,7 @@ jq -nf /dev/stdin \
   --arg huge_pages_size_kb "$huge_pages_size_kb" \
   --arg pgbench_prewarm "$pgbench_prewarm" \
   --arg mixed_workload "$mixed_workload" \
+  --arg dmdelay "$dmdelay" \
   > "$output_filename" \
 <<'EOF'
   {
@@ -501,6 +582,7 @@ jq -nf /dev/stdin \
         disk: {
           block_device_settings: $block_device_settings[0],
           filesystem: $filesystem_info,
+          dmdelay: $dmdelay,
         },
       },
       postgres: {
