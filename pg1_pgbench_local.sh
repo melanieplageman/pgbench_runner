@@ -36,6 +36,7 @@ mixed_workload=0
 process_name=checkpointer
 pgbench_prewarm="$var_prewarm"
 do_buffercache=1
+do_rel_size=1
 dmdelay="0"
 
 pgbench[mode]='prepared'
@@ -279,6 +280,9 @@ if [ "$pgbench_prewarm" -eq 1 ] ; then
   "${PSQL_PRIMARY[@]}" -c "SELECT pg_prewarm(oid::regclass), relname FROM pg_class WHERE relname LIKE 'pgbench%'"
 fi
 
+"${PSQL_PRIMARY[@]}" -c "SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared('io')"
+"${PSQL_PRIMARY[@]}" -c "SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared('wal')"
+
 # Dirty writeback
 ./meminfo.sh &
 meminfo_pid=$!
@@ -318,27 +322,16 @@ EOF
 EOF
 aggwaits_pid=$!
 
-# watch pg_stat_io checkpointer
-"${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/pg_stat_io_checkpointer_progress.raw"
+# watch pg_stat_io
+"${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/pg_stat_io_progress.raw"
   SELECT NOW() AS ts, * FROM pg_stat_io LIMIT 0;
 EOF
 
-"${PSQL_PRIMARY[@]}" -At >> "$tmpdir/pg_stat_io_checkpointer_progress.raw" -f- <<EOF &
-  SELECT NOW() AS ts, * FROM pg_stat_io WHERE backend_type = 'checkpointer';
+"${PSQL_PRIMARY[@]}" -At >> "$tmpdir/pg_stat_io_progress.raw" -f- <<EOF &
+  SELECT NOW() AS ts, * FROM pg_stat_io;
   \watch 1
 EOF
-pg_stat_io_checkpointer_progress_pid=$!
-
-# watch pg_stat_io normal backend
-"${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/pg_stat_io_backend_normal_perm_progress.raw"
-  SELECT NOW() AS ts, * FROM pg_stat_io LIMIT 0;
-EOF
-
-"${PSQL_PRIMARY[@]}" -At >> "$tmpdir/pg_stat_io_backend_normal_perm_progress.raw" -f- <<EOF &
-  SELECT NOW() AS ts, * FROM pg_stat_io WHERE backend_type = 'client backend' and context = 'normal' and object = 'relation';
-  \watch 1
-EOF
-pg_stat_io_backend_normal_perm_progress_pid=$!
+pg_stat_io_progress=$!
 
 "${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/buffercache_progress.raw"
   SELECT NOW() AS ts, * FROM pg_buffercache_summary() LIMIT 1;
@@ -449,8 +442,8 @@ else
       2> "$tmpdir/pgbench_run_progress.raw"
 fi
 
-kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid $pg_stat_io_checkpointer_progress_pid
-kill -INT $pg_stat_io_backend_normal_perm_progress_pid $aggwaits_pid
+kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid $pg_stat_io_progress_pid
+kill -INT $aggwaits_pid
 kill $meminfo_pid
 if [ "$do_buffercache" -eq 1 ]; then
   kill -INT $buffercache_progress_pid
@@ -476,8 +469,7 @@ cp "$PRIMARY_LOGFILE" "$tmpdir/logfile_after"
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_progress.py "$tmpdir/pgbench_run_progress.raw" > "$tmpdir/pgbench_run_progress.json"
 python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_summary.py "$tmpdir/pgbench_run_summary.raw" > "$tmpdir/pgbench_run_summary.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_wal_progress.raw" > "$tmpdir/pg_stat_wal_progress.json"
-python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_io_checkpointer_progress.raw" > "$tmpdir/pg_stat_io_checkpointer_progress.json"
-python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_io_backend_normal_perm_progress.raw" > "$tmpdir/pg_stat_io_backend_normal_perm_progress.json"
+python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_io_progress.raw" > "$tmpdir/pg_stat_io_progress.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/buffercache_progress.raw" > "$tmpdir/buffercache_progress.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/aggwaits.raw" > "$tmpdir/aggwaits.json"
 
@@ -547,8 +539,7 @@ jq -nf /dev/stdin \
   --slurpfile meminfo "meminfo.json" \
   --slurpfile iostat "$tmpdir/iostat.json" \
   --slurpfile pg_stat_wal_progress "$tmpdir/pg_stat_wal_progress.json" \
-  --slurpfile pg_stat_io_checkpointer_progress "$tmpdir/pg_stat_io_checkpointer_progress.json" \
-  --slurpfile pg_stat_io_backend_normal_perm_progress "$tmpdir/pg_stat_io_backend_normal_perm_progress.json" \
+  --slurpfile pg_stat_io_progress "$tmpdir/pg_stat_io_progress.json" \
   --slurpfile aggwaits "$tmpdir/aggwaits.json" \
   --slurpfile pg_buffercache_progress "$tmpdir/buffercache_progress.json" \
   --slurpfile pidstat_data pidstat_"${process_name}".json \
@@ -613,8 +604,7 @@ jq -nf /dev/stdin \
       meminfo: $meminfo[0],
       iostat: $iostat[0],
       walstat: $pg_stat_wal_progress[0],
-      iocheckpointerstat: $pg_stat_io_checkpointer_progress[0],
-      iobackendnormstat: $pg_stat_io_backend_normal_perm_progress[0],
+      pgiostat: $pg_stat_io_progress[0],
       waits: $aggwaits[0],
       buffercache: $pg_buffercache_progress[0],
       pidstat: [
