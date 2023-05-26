@@ -36,7 +36,8 @@ mixed_workload=0
 process_name=checkpointer
 pgbench_prewarm="$var_prewarm"
 do_buffercache=1
-do_rel_size=1
+watch_relsize=1
+rel_to_watch_size="large_select"
 dmdelay="0"
 
 pgbench[mode]='prepared'
@@ -331,7 +332,7 @@ EOF
   SELECT NOW() AS ts, * FROM pg_stat_io;
   \watch 1
 EOF
-pg_stat_io_progress=$!
+pg_stat_io_progress_pid=$!
 
 "${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/buffercache_progress.raw"
   SELECT NOW() AS ts, * FROM pg_buffercache_summary() LIMIT 1;
@@ -343,6 +344,19 @@ if [ "$do_buffercache" -eq 1 ]; then
   \watch 5
 EOF
 buffercache_progress_pid=$!
+fi
+
+# watch relation size
+if [ "$watch_relsize" -eq 1 ]; then
+"${PSQL_PRIMARY[@]}" -A -f- <<EOF | head -1 > "$tmpdir/relation_size_progress.raw"
+  SELECT NOW() AS ts, null as relation_size LIMIT 0;
+EOF
+
+"${PSQL_PRIMARY[@]}" -At >> "$tmpdir/relation_size_progress.raw" -f- <<EOF &
+  SELECT NOW() AS ts, pg_total_relation_size('$rel_to_watch_size') as relation_size;
+  \watch 5
+EOF
+relsize_progress_pid=$!
 fi
 
 # \set aid random_gaussian(1, 100000 * ${pgbench[scale]}, 10)
@@ -442,11 +456,14 @@ else
       2> "$tmpdir/pgbench_run_progress.raw"
 fi
 
-kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid $pg_stat_io_progress_pid
-kill -INT $aggwaits_pid
+kill -INT $iostat_pid $pidstat_pid $pg_stat_wal_progress_pid $pg_stat_io_progress_pid $aggwaits_pid
 kill $meminfo_pid
 if [ "$do_buffercache" -eq 1 ]; then
   kill -INT $buffercache_progress_pid
+fi
+
+if [ "$watch_relsize" -eq 1 ]; then
+  kill -INT $relsize_progress_pid
 fi
 
 "${PSQL_PRIMARY[@]}" \
@@ -471,6 +488,7 @@ python3 /home/mplageman/code/pgbench_runner/pgbench_parse_run_summary.py "$tmpdi
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_wal_progress.raw" > "$tmpdir/pg_stat_wal_progress.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/pg_stat_io_progress.raw" > "$tmpdir/pg_stat_io_progress.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/buffercache_progress.raw" > "$tmpdir/buffercache_progress.json"
+python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/relation_size_progress.raw" > "$tmpdir/relation_size_progress.json"
 python3 /home/mplageman/code/pgbench_runner/parse_watch_progress.py "$tmpdir/aggwaits.raw" > "$tmpdir/aggwaits.json"
 
 # Parse iostat output
@@ -487,7 +505,7 @@ if [ "$do_custom_ddl" -eq 1 ] ; then
   #   -At -c "SELECT pg_total_relation_size('has_ossp_uuid');")"
 
   copy_table_size_after="$("${PSQL_PRIMARY[@]}" \
-    -At -c "SELECT pg_total_relation_size('large_select');")"
+    -At -c "SELECT pg_total_relation_size('$rel_to_watch_size');")"
 
   # copy_table_size_after="$("${PSQL_PRIMARY[@]}" \
   #   -At -c "SELECT pg_total_relation_size('has_default_uuid');")"
@@ -542,6 +560,7 @@ jq -nf /dev/stdin \
   --slurpfile pg_stat_io_progress "$tmpdir/pg_stat_io_progress.json" \
   --slurpfile aggwaits "$tmpdir/aggwaits.json" \
   --slurpfile pg_buffercache_progress "$tmpdir/buffercache_progress.json" \
+  --slurpfile relation_size_progress "$tmpdir/relation_size_progress.json" \
   --slurpfile pidstat_data pidstat_"${process_name}".json \
   --arg pidstat_procname "$process_name" \
   --arg build_sha "$build_sha" \
@@ -607,6 +626,7 @@ jq -nf /dev/stdin \
       pgiostat: $pg_stat_io_progress[0],
       waits: $aggwaits[0],
       buffercache: $pg_buffercache_progress[0],
+      relationsize: $relation_size_progress[0],
       pidstat: [
         {
           name: $pidstat_procname,
