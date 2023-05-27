@@ -91,9 +91,9 @@ shared_buffers_kb=$(echo "$var_shared_buffers * 8" | bc)
 enough_hugepages=$(echo "($shared_buffers_kb / $huge_pages_size_kb) + 5" | bc)
 
 postgres_huge_pages="off"
-# if [ $huge_pages_free -gt $enough_hugepages ]; then
-#   postgres_huge_pages="on"
-# fi
+if [ $huge_pages_free -gt $enough_hugepages ]; then
+  postgres_huge_pages="on"
+fi
 
 # Get NCPUS
 ncpus=$(lscpu -J | jq '.lscpu | .[] | select(.field == "CPU(s):") | .data | tonumber')
@@ -171,16 +171,18 @@ fi
 
 
 # "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET plan_cache_mode = force_generic_plan;"
-# "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '2ms';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '1ms';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET wal_compression = 'off';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = '1MB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_wal_size = '150GB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET min_wal_size = '150GB';"
-"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_connections = 500;"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET max_connections = 1000;"
+# "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET autovacuum_freeze_max_age= 3000000000;"
 # "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM RESET max_prepared_transactions;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET track_io_timing=on;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET log_checkpoints = on;"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET wal_buffers = '1GB';"
+"${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET maintenance_work_mem = '1GB';"
 "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET huge_pages = '$postgres_huge_pages';"
 
 # "${PSQL_PRIMARY[@]}" -c "ALTER SYSTEM SET backend_flush_after = 0;"
